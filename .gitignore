@@ -1,5 +1,4 @@
 /lib/target
-Cargo.lock
 **/build/
 .gradle/
 .DS_Store

@@ -1,4 +1,4 @@
-//! hyper4k —— Tokio + Hyper HTTP 引擎，通过零拷贝 C ABI 暴露。
+//! hyper4k —— Tokio + Hyper HTTP 引擎，通过借用切片 C ABI 暴露。
 //!
 //! 这一层**只做协议与传输**：accept / parse / body 聚合 / 写回 / 连接生命周期。
 //! 路由、中间件、handler 一律由上层（Kotlin / Neton）负责。
@@ -20,6 +20,8 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // C 可见的数据布局
 // ---------------------------------------------------------------------------
@@ -33,7 +35,10 @@ pub struct Hyper4kSlice {
 impl Hyper4kSlice {
     #[inline]
     fn borrow(b: &[u8]) -> Self {
-        Hyper4kSlice { ptr: b.as_ptr(), len: b.len() }
+        Hyper4kSlice {
+            ptr: b.as_ptr(),
+            len: b.len(),
+        }
     }
 }
 
@@ -76,7 +81,7 @@ pub struct Hyper4kResponder {
 
 pub struct Hyper4kServer {
     // drop 时关闭 runtime
-    runtime: Runtime,
+    _runtime: Runtime,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -101,28 +106,41 @@ async fn handle(
     }
 
     // v1：聚合 body（流式版本未来用 Incoming 的 frame stream 实现）
-    let body: Bytes = match req.into_body().collect().await {
+    let body: Bytes = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(c) => c.to_bytes(),
-        Err(_) => Bytes::new(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(413)
+                .body(Full::new(Bytes::from_static(
+                    b"hyper4k: request body too large",
+                )))
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
+        }
     };
 
     let (tx, rx) = oneshot::channel::<ResponseData>();
-    let responder: *mut Hyper4kResponder =
-        Box::into_raw(Box::new(Hyper4kResponder { tx: Some(tx) }));
+    // Keep Rust ownership while exposing a stable pointer to the callback. This
+    // makes the request future Send and releases the responder if it is cancelled.
+    let mut responder = Box::new(Hyper4kResponder { tx: Some(tx) });
 
     // 这些局部变量（method/path/query/header_buf/body）在 await 期间保持存活，
     // 因此借用给 Kotlin 的切片在 hyper4k_respond 被调用前始终有效。
-    let creq = Hyper4kRequest {
-        method: Hyper4kSlice::borrow(method.as_bytes()),
-        path: Hyper4kSlice::borrow(path.as_bytes()),
-        query: Hyper4kSlice::borrow(query.as_bytes()),
-        headers: Hyper4kSlice::borrow(header_buf.as_bytes()),
-        body: Hyper4kSlice::borrow(&body),
-        responder,
-    };
+    {
+        let creq = Hyper4kRequest {
+            method: Hyper4kSlice::borrow(method.as_bytes()),
+            path: Hyper4kSlice::borrow(path.as_bytes()),
+            query: Hyper4kSlice::borrow(query.as_bytes()),
+            headers: Hyper4kSlice::borrow(header_buf.as_bytes()),
+            body: Hyper4kSlice::borrow(&body),
+            responder: responder.as_mut(),
+        };
 
-    // 调进 Kotlin。约定：尽快返回，稍后（可在另一线程）调用 hyper4k_respond。
-    (ctx.cb)(ctx.user_data, &creq as *const Hyper4kRequest);
+        // 调进 Kotlin。约定：尽快返回，稍后（可在另一线程）调用 hyper4k_respond。
+        (ctx.cb)(ctx.user_data, &creq as *const Hyper4kRequest);
+    }
 
     let resp_data = match rx.await {
         Ok(d) => d,
@@ -132,9 +150,6 @@ async fn handle(
             body: b"hyper4k: handler dropped responder".to_vec(),
         },
     };
-
-    // Kotlin 已经 respond 完毕，可以安全回收 responder。
-    unsafe { drop(Box::from_raw(responder)); }
 
     let mut builder = Response::builder().status(resp_data.status);
     for (k, v) in &resp_data.headers {
@@ -165,7 +180,10 @@ pub unsafe extern "C" fn hyper4k_server_start(
     let host = if host.is_null() {
         "0.0.0.0".to_owned()
     } else {
-        CStr::from_ptr(host).to_str().unwrap_or("0.0.0.0").to_owned()
+        CStr::from_ptr(host)
+            .to_str()
+            .unwrap_or("0.0.0.0")
+            .to_owned()
     };
 
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
@@ -173,7 +191,10 @@ pub unsafe extern "C" fn hyper4k_server_start(
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(r) => r,
         Err(_) => return std::ptr::null_mut(),
     };
@@ -184,7 +205,10 @@ pub unsafe extern "C" fn hyper4k_server_start(
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let ctx = Arc::new(CallbackCtx { cb: on_request, user_data });
+    let ctx = Arc::new(CallbackCtx {
+        cb: on_request,
+        user_data,
+    });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
     runtime.spawn(async move {
@@ -209,7 +233,10 @@ pub unsafe extern "C" fn hyper4k_server_start(
         }
     });
 
-    Box::into_raw(Box::new(Hyper4kServer { runtime, shutdown_tx: Some(shutdown_tx) }))
+    Box::into_raw(Box::new(Hyper4kServer {
+        _runtime: runtime,
+        shutdown_tx: Some(shutdown_tx),
+    }))
 }
 
 /// 完成一个请求。每个 responder 只能调用一次。
@@ -238,7 +265,11 @@ pub unsafe extern "C" fn hyper4k_respond(
     };
 
     if let Some(tx) = r.tx.take() {
-        let _ = tx.send(ResponseData { status, headers, body });
+        let _ = tx.send(ResponseData {
+            status,
+            headers,
+            body,
+        });
     }
 }
 
@@ -278,7 +309,88 @@ unsafe fn parse_headers(ptr: *const u8, len: usize) -> Vec<(String, String)> {
             let idx = line.find(':')?;
             let name = line[..idx].trim().to_owned();
             let value = line[idx + 1..].trim().to_owned();
-            if name.is_empty() { None } else { Some((name, value)) }
+            if name.is_empty() {
+                None
+            } else {
+                Some((name, value))
+            }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        hyper4k_respond, hyper4k_server_start, hyper4k_server_stop, parse_headers, Hyper4kRequest,
+    };
+    use std::ffi::{c_void, CString};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener as StdTcpListener, TcpStream};
+
+    #[test]
+    fn parses_header_block() {
+        let raw = b"Content-Type: application/json\nX-Request-Id: abc\r\n";
+        let headers = unsafe { parse_headers(raw.as_ptr(), raw.len()) };
+
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("X-Request-Id".to_owned(), "abc".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_header_lines() {
+        let raw = b"invalid\n: empty-name\nValid: value\n";
+        let headers = unsafe { parse_headers(raw.as_ptr(), raw.len()) };
+
+        assert_eq!(headers, vec![("Valid".to_owned(), "value".to_owned())]);
+    }
+
+    #[test]
+    fn accepts_empty_header_block() {
+        let headers = unsafe { parse_headers(std::ptr::null(), 0) };
+        assert!(headers.is_empty());
+    }
+
+    extern "C" fn test_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
+        let body = b"hello from hyper4k";
+        let headers = b"Content-Type: text/plain\nConnection: close\n";
+        unsafe {
+            hyper4k_respond(
+                (*request).responder,
+                201,
+                headers.as_ptr(),
+                headers.len(),
+                body.as_ptr(),
+                body.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn serves_request_through_c_abi() {
+        let probe = StdTcpListener::bind("127.0.0.1:0").expect("allocate test port");
+        let port = probe.local_addr().expect("test address").port();
+        drop(probe);
+
+        let host = CString::new("127.0.0.1").expect("host");
+        let server = unsafe {
+            hyper4k_server_start(host.as_ptr(), port, test_handler, std::ptr::null_mut())
+        };
+        assert!(!server.is_null());
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 201 Created"), "{response}");
+        assert!(response.ends_with("hello from hyper4k"), "{response}");
+        unsafe { hyper4k_server_stop(server) };
+    }
 }

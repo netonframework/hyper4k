@@ -1,8 +1,11 @@
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 
 plugins {
-    alias(libs.plugins.kotlin.multiplatform)
+    kotlin("multiplatform") version "2.3.10"
 }
+
+group = "com.netonframework"
+version = "0.1.0"
 
 repositories {
     mavenCentral()
@@ -22,21 +25,33 @@ val crateDir = file("$projectDir/lib")
 val headerDir = file("$crateDir/include")
 
 kotlin {
+    applyDefaultHierarchyTemplate()
     macosArm64()
     macosX64()
     linuxX64()
     linuxArm64()
     mingwX64()
 
+    sourceSets {
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+    }
+
     targets.withType<KotlinNativeTarget>().configureEach {
-        val triple = rustTriples[name] ?: return@configureEach
+        val targetName = name
+        val triple = rustTriples[targetName] ?: return@configureEach
         val libDir = file("$crateDir/target/$triple/release")
 
-        compilations.getByName("main").cinterops.create("hyper4k") {
+        val interop = compilations.getByName("main").cinterops.create("hyper4k") {
             defFile(project.file("src/nativeInterop/cinterop/hyper4k.def"))
             includeDirs(headerDir)
             // 静态库目录按 target 注入；libhyper4k.a 由 cargo 产出
             extraOpts("-libraryPath", libDir.absolutePath)
+        }
+
+        tasks.named(interop.interopProcessingTaskName).configure {
+            dependsOn("cargoBuild${targetName.replaceFirstChar { it.uppercase() }}")
         }
 
         // 链接 hyper4k 需要的系统库（Rust std / tokio 依赖）
@@ -50,12 +65,6 @@ kotlin {
         }
     }
 
-    sourceSets {
-        val commonMain by getting
-        val nativeMain by creating { dependsOn(commonMain) }
-        listOf("macosArm64Main", "macosX64Main", "linuxX64Main", "linuxArm64Main", "mingwX64Main")
-            .forEach { getByName(it).dependsOn(nativeMain) }
-    }
 }
 
 // --- 便捷任务：构建 Rust crate（每个 triple 一个 libhyper4k.a） ---

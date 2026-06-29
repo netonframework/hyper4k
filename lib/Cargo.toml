@@ -2,9 +2,9 @@
 name = "hyper4k"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance Tokio + Hyper HTTP engine exposed over a zero-copy C ABI, designed as the native backend for the Neton (Kotlin/Native) web framework."
+description = "High-performance Tokio + Hyper HTTP engine with Kotlin/Native bindings for Neton."
 license = "Apache-2.0"
-repository = "https://github.com/neton/hyper4k"
+repository = "https://github.com/netonframework/hyper4k"
 
 [lib]
 name = "hyper4k"

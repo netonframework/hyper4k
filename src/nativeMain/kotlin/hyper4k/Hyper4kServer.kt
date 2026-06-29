@@ -1,6 +1,7 @@
 package hyper4k
 
 import hyper4k.cinterop.*
+import hyper4k.cinterop.Hyper4kRequest as CHyper4kRequest
 import kotlinx.cinterop.*
 
 /**
@@ -32,16 +33,12 @@ class Hyper4kServer(
         check(server == null) { "hyper4k server already started" }
         val ref = StableRef.create(handler)
         handlerRef = ref
-        // host 仅在 start 内被 Rust 同步读取（拷成 owned String）后即返回，
-        // 因此 cstr 的临时缓冲在 memScoped 内有效即可。
-        val s = memScoped {
-            hyper4k_server_start(
-                host = host.cstr.ptr,
-                port = port.toUShort(),
-                on_request = staticCFunction(::onRequest),
-                user_data = ref.asCPointer(),
-            )
-        }
+        val s = hyper4k_server_start(
+            host = host,
+            port = port.toUShort(),
+            on_request = staticCFunction(::onRequest),
+            user_data = ref.asCPointer(),
+        )
         if (s == null) {
             ref.dispose()
             handlerRef = null
@@ -61,10 +58,10 @@ class Hyper4kServer(
 
 /**
  * C 回调入口。staticCFunction 不能捕获状态，handler 通过 user_data(StableRef) 取回。
- * 全程零额外分配地把 Rust 切片拷进 Kotlin，再把响应零拷贝（pinned）传回。
+ * 请求数据从 Rust 借用切片复制到 Kotlin；响应使用 pinned 缓冲传入 Rust。
  */
 @OptIn(ExperimentalForeignApi::class)
-private fun onRequest(userData: COpaquePointer?, reqPtr: CPointer<Hyper4kRequest>?) {
+private fun onRequest(userData: COpaquePointer?, reqPtr: CPointer<CHyper4kRequest>?) {
     if (userData == null || reqPtr == null) return
     val handler = userData.asStableRef<Hyper4kHandler>().get()
     val c = reqPtr.pointed

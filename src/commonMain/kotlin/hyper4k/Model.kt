@@ -6,7 +6,7 @@ package hyper4k
  * 注意：这些字段在构造时已从 Rust 的借用切片**拷贝**进 Kotlin 堆，
  * 因此可安全地跨线程、跨协程持有（异步处理也没问题）。
  */
-class Hyper4kRequest internal constructor(
+class Hyper4kRequest(
     val method: String,
     val path: String,
     val query: String,

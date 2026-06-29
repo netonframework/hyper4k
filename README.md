@@ -1,6 +1,6 @@
 # hyper4k
 
-高性能 **Tokio + Hyper** HTTP 引擎，通过**零拷贝 C ABI** 暴露，作为 Neton（Kotlin/Native）Web 框架的原生底座——替代当前的 Ktor CIO。
+高性能 **Tokio + Hyper** HTTP 引擎，通过借用切片 C ABI 暴露，作为 Neton（Kotlin/Native）Web 框架的原生底座。
 
 > 设计原则：hyper4k 只做**协议与传输**（accept / parse / body / 写回 / 连接生命周期）。
 > 路由、中间件、handler 全部留在 Neton（Kotlin）侧。Hyper 永远不碰路由表。
@@ -63,15 +63,27 @@ cargo build --release --target x86_64-pc-windows-gnu    # mingwX64
 跨平台交叉编译推荐 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)：
 `cargo zigbuild --release --target <triple>`。产物在 `lib/target/<triple>/release/libhyper4k.a`。
 
-> 当前沙箱无法联网到 crates.io，crate 未在此环境编译验证——请在本机 `cargo build` 确认。
+运行 Rust 验证：
+
+```bash
+cd lib
+cargo fmt --all -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
 
 ## 构建 Kotlin/Native 封装
 
 根目录的 `build.gradle.kts` 已配置：5 个 K/Native target、按 target 注入 `libhyper4k.a`
 路径的 cinterop、各平台链接所需系统库，以及便捷的 `cargoBuild<Target>` 任务。
 
-把本项目加入 `settings.gradle.kts` 作为模块（例如 `:hyper4k`），
-或作为 composite build 引入 Neton。
+本机 Kotlin/Native 验证：
+
+```bash
+./gradlew macosArm64Test
+```
+
+其他平台使用对应的 `<target>Test` 任务。Gradle 会先构建相同 target 的 Rust 静态库。
 
 ## 接入 neton-http
 
@@ -85,8 +97,7 @@ cargo build --release --target x86_64-pc-windows-gnu    # mingwX64
        else KtorHttpAdapter(serverConfig)
    ```
 
-3. 完成 `HyperHttpAdapter.dispatch()` 里的集成 TODO（构造 HttpContext →
-   `requestEngine.processRequest` → `ApiEnvelope` 序列化），对照 `KtorHttpAdapter.handleRoute`。
+3. `HyperHttpAdapter` maps requests into Neton routing, security, parameter binding, and response envelopes.
 
 ## 压测对比
 
@@ -109,7 +120,8 @@ Rust 底座收益最小——别用它来判断是否值得迁移。
 ## 路线图
 
 - [x] v1：单请求聚合 body 的同步打通（method/path/headers/body + 写回）
-- [ ] HyperHttpAdapter 完整 HttpContext 映射（对照 KtorHttpAdapter）
+- [x] HyperHttpAdapter JSON / form / security / CORS request pipeline
+- [ ] Multipart upload support
 - [ ] 异步 handoff：回调入队 Kotlin 协程、立即返回，不占用 Tokio worker
 - [ ] 流式 body / SSE relay（AI gateway：chunk transform、client disconnect、usage capture）
 - [ ] HTTP/2（`hyper::server::conn::http2`）
