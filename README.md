@@ -12,7 +12,7 @@ hyper4k (Rust crate, lib/)   Tokio runtime + Hyper 协议引擎 + C ABI
    ↓ cinterop
 hyper4k (Kotlin/Native 项目)   可复用的封装（Hyper4kServer / Request / Response）
    ↓ 依赖
-neton-http: HyperHttpAdapter   实现 neton 的 HttpAdapter，接进 RouteMatcher / RequestEngine
+neton-http-hyper4k             可选 Neton Adapter，接进 RouteMatcher / RequestEngine
 ```
 
 hyper4k 本身是一个 Kotlin/Native 项目，Rust 引擎作为 `lib/` 子目录内嵌：
@@ -85,19 +85,27 @@ cargo clippy --all-targets -- -D warnings
 
 其他平台使用对应的 `<target>Test` 任务。Gradle 会先构建相同 target 的 Rust 静态库。
 
-## 接入 neton-http
+## 接入 Neton
 
-1. 让 `:neton-http` 依赖 `:hyper4k`。
-2. `HyperHttpAdapter`（已在 `neton-http` 中）实现 `HttpAdapter`，可与 `KtorHttpAdapter`
-   并存。在 Component 层按 config 选择注入哪个：
+Neton 默认只依赖并加载 Ktor Adapter。使用 Hyper 的应用显式引入
+`neton-http-hyper4k`，由 Adapter 传递兼容的 `hyper4k` 版本；注册 Provider 后再由配置选择引擎：
 
-   ```kotlin
-   val adapter: HttpAdapter =
-       if (config.engine == "hyper4k") HyperHttpAdapter(serverConfig)
-       else KtorHttpAdapter(serverConfig)
-   ```
+```kotlin
+import neton.http.hyper4k.enableHyper4kAdapter
 
-3. `HyperHttpAdapter` maps requests into Neton routing, security, parameter binding, and response envelopes.
+Neton.run(args) {
+    enableHyper4kAdapter()
+    http { port = 8080 }
+}
+```
+
+```toml
+[http]
+engine = "hyper4k"
+```
+
+`hyper4k` 本身不依赖 Neton；`neton-http-hyper4k` 才负责 routing、security、parameter
+binding 和 response envelope。未选择 Hyper 的应用不会链接 Rust/FFI 产物。
 
 ## 压测对比
 
