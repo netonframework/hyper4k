@@ -1,0 +1,27 @@
+[package]
+name = "hyper4k"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Tokio + Hyper HTTP engine exposed over a zero-copy C ABI, designed as the native backend for the Neton (Kotlin/Native) web framework."
+license = "Apache-2.0"
+repository = "https://github.com/neton/hyper4k"
+
+[lib]
+name = "hyper4k"
+# staticlib -> 静态链进 Kotlin/Native 二进制（分发最干净）
+# cdylib    -> 本地开发 / JVM 侧也能用
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"   # 不让 panic 跨 FFI 边界（UB）；handler 内部错误用状态码表达
+strip = true

@@ -1,0 +1,17 @@
+# cinterop 定义。Gradle 的 cinterop 任务用它生成 Kotlin 绑定。
+#
+# staticLibraries / libraryPaths 在 build.gradle.kts 里按 target 注入更灵活，
+# 这里给出默认值便于命令行 cinterop 调试。
+
+package = hyper4k.cinterop
+headers = hyper4k.h
+headerFilter = hyper4k.h
+
+# 头文件搜索路径由 build.gradle.kts 的 includeDirs(headerDir) 注入（rust/include）。
+
+# 静态库：由 `cargo build --release` 产出 libhyper4k.a
+# libraryPaths / staticLibraries 由 build.gradle.kts 按 target 注入：
+#   linuxX64     -> target/x86_64-unknown-linux-gnu/release
+#   macosArm64   -> target/aarch64-apple-darwin/release
+#   ...
+staticLibraries = libhyper4k.a
