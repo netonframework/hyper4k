@@ -87,25 +87,20 @@ cargo clippy --all-targets -- -D warnings
 
 ## 接入 Neton
 
-Neton 默认只依赖并加载 Ktor Adapter。使用 Hyper 的应用显式引入
-`neton-http-hyper4k`，由 Adapter 传递兼容的 `hyper4k` 版本；注册 Provider 后再由配置选择引擎：
+Neton 默认只包含 Ktor Adapter。独立的 `neton-http-hyper4k` 仓库负责 Neton 集成，
+应用引入后把 Adapter 构造器直接传给 HTTP Component：
 
 ```kotlin
-import neton.http.hyper4k.enableHyper4kAdapter
+import neton.http.hyper4k.Hyper4kHttpAdapter
 
 Neton.run(args) {
-    enableHyper4kAdapter()
-    http { port = 8080 }
+    http(::Hyper4kHttpAdapter) { port = 8080 }
 }
 ```
 
-```toml
-[http]
-engine = "hyper4k"
-```
-
 `hyper4k` 本身不依赖 Neton；`neton-http-hyper4k` 才负责 routing、security、parameter
-binding 和 response envelope。未选择 Hyper 的应用不会链接 Rust/FFI 产物。
+binding 和 response envelope。Adapter 选择属于编译期应用代码，不使用 `http.engine`
+配置或运行时 Provider 注册；未引入 Hyper Adapter 的应用不会链接 Rust/FFI 产物。
 
 ## 压测对比
 
@@ -128,7 +123,7 @@ Rust 底座收益最小——别用它来判断是否值得迁移。
 ## 路线图
 
 - [x] v1：单请求聚合 body 的同步打通（method/path/headers/body + 写回）
-- [x] HyperHttpAdapter JSON / form / security / CORS request pipeline
+- [x] Hyper4kHttpAdapter JSON / form / security / CORS request pipeline
 - [ ] Multipart upload support
 - [ ] 异步 handoff：回调入队 Kotlin 协程、立即返回，不占用 Tokio worker
 - [ ] 流式 body / SSE relay（AI gateway：chunk transform、client disconnect、usage capture）
