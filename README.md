@@ -33,13 +33,17 @@ hyper4k/
 
 ```c
 Hyper4kServer* hyper4k_server_start(host, port, on_request, user_data);  // 绑定失败返回 NULL
-void           hyper4k_respond(responder, status, headers_ptr,len, body_ptr,len); // 每请求一次
+int32_t        hyper4k_respond(responder, status, headers_ptr,len, body_ptr,len); // 成功返回 1
 void           hyper4k_server_stop(server);
 ```
 
 线程模型（push）：`on_request` 在 Tokio worker 线程上被调用，语义上应尽快返回，之后
-（可在另一线程）调用 `hyper4k_respond` 完成该请求。请求切片在 `respond` 之前有效；
-要异步处理就先把字节拷走。crate 以 `panic = "abort"` 编译，保证 panic 不跨 FFI。
+（可在另一线程）调用 `hyper4k_respond` 完成该请求。Kotlin 封装会在回调内复制请求快照，
+然后交给受管协程执行 `suspend` handler。响应句柄是单次数字 token；请求已取消或已经响应时，
+迟到调用安全返回 0。crate 以 `panic = "abort"` 编译，保证 panic 不跨 FFI。
+
+默认并发是有界的：达到上限立即返回 503，单请求超过 deadline 返回 504。停止时先停止接收
+新任务、等待在途 handler 到达 grace deadline，再关闭 Tokio。不存在同步 handoff 开关。
 
 ## 构建 Rust crate
 
@@ -122,10 +126,11 @@ Rust 底座收益最小——别用它来判断是否值得迁移。
 
 ## 路线图
 
-- [x] v1：单请求聚合 body 的同步打通（method/path/headers/body + 写回）
+- [x] v1：单请求聚合 body 打通（method/path/headers/body + 写回）
 - [x] Hyper4kHttpAdapter JSON / form / security / CORS request pipeline
+- [x] 异步 handoff：回调复制请求后立即返回，Kotlin/Native 协程处理 suspend handler
+- [x] 有界并发、请求超时与优雅停止
 - [ ] Multipart upload support
-- [ ] 异步 handoff：回调入队 Kotlin 协程、立即返回，不占用 Tokio worker
 - [ ] 流式 body / SSE relay（AI gateway：chunk transform、client disconnect、usage capture）
 - [ ] HTTP/2（`hyper::server::conn::http2`）
 - [ ] 可选 `hyper4k-tower`：接入 Tower 生态（timeout / trace / load-shed）

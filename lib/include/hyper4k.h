@@ -11,7 +11,7 @@
  * 线程模型（push 模型）：
  *   on_request 回调在 Tokio worker 线程上被调用。语义上它应当“尽快返回”，并在
  *   之后（可在另一线程）调用 hyper4k_respond() 完成该请求。每个请求对应一个独立的
- *   Hyper4kResponder*，只能被 respond 一次。
+ *   Hyper4kResponder。句柄失效后的迟到或重复响应会安全返回失败。
  *
  * panic 安全：crate 以 panic = "abort" 编译，保证 Rust panic 不会跨越 FFI 边界。
  */
@@ -27,7 +27,7 @@ extern "C" {
 
 /* 不透明句柄 */
 typedef struct Hyper4kServer Hyper4kServer;
-typedef struct Hyper4kResponder Hyper4kResponder;
+typedef uint64_t Hyper4kResponder;
 
 /* 借用的字节切片（ptr 可能为 NULL 当 len == 0） */
 typedef struct Hyper4kSlice {
@@ -37,7 +37,7 @@ typedef struct Hyper4kSlice {
 
 /*
  * 单次请求视图。所有切片在 on_request 调用期间有效，
- * 在你调用 hyper4k_respond(responder, ...) 之前保持有效。
+ * 在你调用 hyper4k_respond(responder, ...) 之前保持有效。异步消费者应在回调返回前复制。
  * headers 为扁平文本块，每行 "Name: Value\n"。
  */
 typedef struct Hyper4kRequest {
@@ -46,7 +46,7 @@ typedef struct Hyper4kRequest {
     Hyper4kSlice query;     /* a=1&b=2 （不含 '?'）             */
     Hyper4kSlice headers;   /* "Name: Value\n" 串联             */
     Hyper4kSlice body;      /* 已聚合的请求体（v1 非流式）      */
-    Hyper4kResponder *responder;
+    Hyper4kResponder responder;
 } Hyper4kRequest;
 
 /* 每请求回调。user_data 即 start 时传入的指针。 */
@@ -62,14 +62,17 @@ Hyper4kServer *hyper4k_server_start(const char *host,
                                    void *user_data);
 
 /*
- * 完成一个请求。每个 responder 必须且只能调用一次。
+ * 完成一个请求（拷贝版）。返回 1 表示已交付，0 表示 responder 已失效或已经完成。
  * headers 与 body 在本调用内被拷贝，返回后你的缓冲即可释放。
  * headers 编码同请求：每行 "Name: Value\n"（可为空 -> 传 NULL,0）。
+ *
+ * ABI v2 同步快路径：若在 on_request 回调内调用本函数（即 handler 同步完成），
+ * 响应直接回填给连接处理协程，不经过异步通道。
  */
-void hyper4k_respond(Hyper4kResponder *responder,
-                     uint16_t status,
-                     const uint8_t *headers_ptr, size_t headers_len,
-                     const uint8_t *body_ptr, size_t body_len);
+int32_t hyper4k_respond(Hyper4kResponder responder,
+                       uint16_t status,
+                       const uint8_t *headers_ptr, size_t headers_len,
+                       const uint8_t *body_ptr, size_t body_len);
 
 /* 优雅停止并释放服务器句柄。停止后 server 指针失效。 */
 void hyper4k_server_stop(Hyper4kServer *server);
