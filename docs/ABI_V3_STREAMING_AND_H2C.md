@@ -1,7 +1,9 @@
 # hyper4k ABI v3：流式响应与 h2c
 
-> 状态：**Rust 侧（§三）与 h2c（§3.3）已实现**，Kotlin 侧（§四）与切引擎（§五）待做。
-> 实现中对本设计做了两处补充，见 §3.4。
+> 状态：**§三（Rust）、§3.3（h2c）、§4.1/4.2（Kotlin live response）已实现**；
+> §4.4 能力声明与 §五 切引擎待做——按 §4.4 的规矩，能力声明要等一致性套件的
+> 流式用例真跑通之后再加，所以它排在套件之后而不是之前。
+> 实现中对本设计做了两处补充，见 §3.4；§4.2 的调度器约束落地方式见 §4.3。
 >
 > 目标：补齐 `STREAMING_RESPONSE` 与 `HTTP_2` 两项引擎能力
 > （Neton [HTTP 引擎能力规范](../../neton-docs/docs/zh-hans/spec/http-engine-capabilities.md)
@@ -191,7 +193,23 @@ UNDISPATCHED 的快路径优化只对「不流式、不挂起」的 handler 成�
 > 这条是本设计里最容易写错、且错了之后只在高并发流式场景才暴露的地方。
 > 一致性测试要专门覆盖：并发 N 个 SSE 连接时，非流式请求的延迟不应劣化。
 
-### 4.3 能力声明
+### 4.3 调度器约束的落地方式（实现补充）
+
+设计只说了「必须切到可阻塞的调度器」，没说切到哪个。实际能用的选项比预想的少：
+
+- `Dispatchers.IO` 在 Kotlin/Native（coroutines 1.11.0）上**还是 internal**，用不了。
+- `Dispatchers.Default` 是所有协程共用的池、按 CPU 数定大小。往里塞阻塞写，
+  几个慢客户端就能把它占满 —— 「慢客户端拖垮所有请求」只是换了个位置发生。
+
+所以 hyper4k 的 Kotlin 层用一个专用的 `newFixedThreadPoolContext(32, "hyper4k-stream")`。
+池大小按「同时**卡住**的流」估，不是「同时活着的流」：通道有容量，
+客户端跟得上时 write 立刻返回、根本不占线程。
+
+这条链路上还有第二道闸：引擎侧真在引擎线程上要阻塞时返回 `HYPER4K_ERR_WOULD_BLOCK`，
+Kotlin 层收到它直接抛异常而不是静默重试 —— 切换一旦失效就会立刻炸出来，
+而不是变成一次只在高并发下才看得见的 p99 劣化。
+
+### 4.4 能力声明
 
 **先让一致性测试通过，再加声明**（能力规范 §6）：
 
@@ -219,6 +237,11 @@ override val capabilities = setOf(
 > 阻塞项：`neton-http-hyper4k` 当前 composite build 的 klib 解析是坏的
 > （`Could not find .../neton-http/build/classes/kotlin/macosArm64/main/klib/neton-http`），
 > 与本设计无关，但不修则这一层动不了。
+>
+> 复验（实现 §4.1 时）：`neton-http-hyper4k` **自己**的 composite build
+> （`includeBuild("../neton")`）编译与 `macosArm64Test` 都通过，没复现这个错误。
+> 所以它更可能是 privchat-application 那侧组合出来的，而不是 neton-http-hyper4k
+> 本身坏了 —— 切引擎第 1 步做完后要在那边先复验一次，再决定要不要修。
 
 ---
 
