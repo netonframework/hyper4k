@@ -33,7 +33,7 @@ class Hyper4kServerTest {
     fun suspendingHandlerCompletesAsynchronously() = runBlocking {
         val response = CompletableDeferred<Hyper4kResponse>()
         val dispatcher = AsyncRequestDispatcher(
-            handler = {
+            handler = { _, _ ->
                 delay(20)
                 Hyper4kResponse.text(body = "async")
             },
@@ -56,7 +56,7 @@ class Hyper4kServerTest {
         val responses = mutableMapOf<ULong, Hyper4kResponse>()
         val secondResponse = CompletableDeferred<Unit>()
         val dispatcher = AsyncRequestDispatcher(
-            handler = {
+            handler = { _, _ ->
                 release.await()
                 Hyper4kResponse.text(body = "first")
             },
@@ -84,7 +84,7 @@ class Hyper4kServerTest {
     fun timesOutSlowHandler() = runBlocking {
         val response = CompletableDeferred<Hyper4kResponse>()
         val dispatcher = AsyncRequestDispatcher(
-            handler = {
+            handler = { _, _ ->
                 delay(1_000)
                 Hyper4kResponse.text(body = "late")
             },
@@ -107,7 +107,7 @@ class Hyper4kServerTest {
         val secondStarted = CompletableDeferred<Unit>()
         val firstCompletionAttempted = CompletableDeferred<Unit>()
         val dispatcher = AsyncRequestDispatcher(
-            handler = {
+            handler = { _, _ ->
                 invocation += 1
                 if (invocation == 2) secondStarted.complete(Unit)
                 Hyper4kResponse.text(body = "ok")
@@ -129,6 +129,93 @@ class Hyper4kServerTest {
         dispatcher.stopAccepting()
         dispatcher.awaitDrained(1_000)
         dispatcher.cancelAndJoin()
+    }
+
+    @Test
+    fun streamingHandlerBypassesTheOneShotWriter() = runBlocking {
+        val channel = RecordingChannel()
+        val finished = CompletableDeferred<Unit>()
+        var oneShotWrites = 0
+        val dispatcher = AsyncRequestDispatcher(
+            handler = { _, out ->
+                out.begin(200, mapOf("Content-Type" to listOf("text/event-stream")))
+                out.write("data: 1\n\n".encodeToByteArray())
+                out.write("data: 2\n\n".encodeToByteArray())
+                out.finish()
+                finished.complete(Unit)
+                Hyper4kResponse.streamed()
+            },
+            maxConcurrentRequests = 1,
+            requestTimeoutMillis = 1_000,
+            complete = { _, _ -> oneShotWrites += 1; true },
+            newChannel = { channel },
+        )
+
+        dispatcher.submit(request(), 1uL)
+        withTimeout(1_000) { finished.await() }
+
+        // 流式响应不能再被一次性写出一遍——那会是「头发两次」。
+        assertEquals(0, oneShotWrites)
+        assertEquals(200, channel.status)
+        assertEquals(listOf("data: 1\n\n", "data: 2\n\n"), channel.chunks)
+        assertTrue(channel.isFinished)
+        dispatcher.stopAccepting()
+        dispatcher.awaitDrained(1_000)
+        dispatcher.cancelAndJoin()
+    }
+
+    @Test
+    fun finishesTheStreamWhenAStreamingHandlerFails() = runBlocking {
+        val channel = RecordingChannel()
+        var oneShotWrites = 0
+        val dispatcher = AsyncRequestDispatcher(
+            handler = { _, out ->
+                out.begin(200)
+                out.write("partial".encodeToByteArray())
+                error("handler blew up halfway through")
+            },
+            maxConcurrentRequests = 1,
+            requestTimeoutMillis = 1_000,
+            complete = { _, _ -> oneShotWrites += 1; true },
+            newChannel = { channel },
+        )
+
+        dispatcher.submit(request(), 1uL)
+        dispatcher.stopAccepting()
+        dispatcher.awaitDrained(1_000)
+
+        // 头早就发出去了，5xx 兜底响应写不回去；唯一正确的动作是收尾，而不是
+        // 在已经开始的流上再写一个完整响应。
+        assertEquals(0, oneShotWrites)
+        assertTrue(channel.isFinished)
+        dispatcher.cancelAndJoin()
+    }
+
+    /** 记录调用的假通道，用来在没有真实 responder 的情况下测调度逻辑。 */
+    private class RecordingChannel : Hyper4kResponseChannel {
+        var status: Int? = null
+        val chunks = mutableListOf<String>()
+        var isFinished = false
+        private var begun = false
+
+        override val isStreaming: Boolean get() = begun && !isFinished
+        override var bytesWritten: Long = 0L
+            private set
+
+        override suspend fun begin(status: Int, headers: Map<String, List<String>>) {
+            this.status = status
+            begun = true
+        }
+
+        override suspend fun write(chunk: ByteArray): Boolean {
+            chunks.add(chunk.decodeToString())
+            bytesWritten += chunk.size
+            return true
+        }
+
+        override suspend fun finish() {
+            isFinished = true
+        }
     }
 
     private fun request() = Hyper4kRequest(
