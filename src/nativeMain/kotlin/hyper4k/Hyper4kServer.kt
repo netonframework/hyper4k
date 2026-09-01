@@ -1,5 +1,9 @@
 package hyper4k
 
+import hyper4k.cinterop.HYPER4K_ERR_CLIENT_GONE
+import hyper4k.cinterop.HYPER4K_ERR_WOULD_BLOCK
+import hyper4k.cinterop.HYPER4K_ERR_WRONG_STATE
+import hyper4k.cinterop.HYPER4K_OK
 import hyper4k.cinterop.Hyper4kRequest as CHyper4kRequest
 import hyper4k.cinterop.hyper4k_respond
 import hyper4k.cinterop.hyper4k_response_begin
@@ -298,12 +302,6 @@ private fun defaultFailureResponse(status: Int, message: String) = Hyper4kRespon
 @OptIn(DelicateCoroutinesApi::class)
 private val streamWriteDispatcher by lazy { newFixedThreadPoolContext(32, "hyper4k-stream") }
 
-/** ABI v3 return codes, kept in step with lib/include/hyper4k.h. */
-private const val ABI_OK = 1
-private const val ABI_ERR_WRONG_STATE = -4
-private const val ABI_ERR_CLIENT_GONE = -5
-private const val ABI_ERR_WOULD_BLOCK = -6
-
 /**
  * Maps [Hyper4kResponseChannel] onto the ABI v3 begin / write / finish calls.
  *
@@ -339,7 +337,7 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
                 headers_len = headerBytes.size.convert(),
             )
         }
-        check(rc == ABI_OK) { "hyper4k_response_begin failed with $rc" }
+        check(rc == HYPER4K_OK) { "hyper4k_response_begin failed with $rc" }
         started = true
     }
 
@@ -358,13 +356,13 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
             }
         }
         return when (rc) {
-            ABI_OK -> {
+            HYPER4K_OK -> {
                 written += chunk.size
                 true
             }
             // The client closed its tab: stop producing data and close. Not an error.
-            ABI_ERR_CLIENT_GONE -> false
-            ABI_ERR_WOULD_BLOCK -> error(
+            HYPER4K_ERR_CLIENT_GONE -> false
+            HYPER4K_ERR_WOULD_BLOCK -> error(
                 "hyper4k_response_write would block on an engine thread; " +
                     "streaming writes must run on a blocking-capable dispatcher",
             )
@@ -376,7 +374,7 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
         if (!started || finished) return
         finished = true
         val rc = hyper4k_response_finish(responder)
-        check(rc == ABI_OK || rc == ABI_ERR_WRONG_STATE) {
+        check(rc == HYPER4K_OK || rc == HYPER4K_ERR_WRONG_STATE) {
             "hyper4k_response_finish failed with $rc"
         }
     }
