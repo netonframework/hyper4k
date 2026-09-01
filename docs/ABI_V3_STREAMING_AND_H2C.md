@@ -1,6 +1,7 @@
 # hyper4k ABI v3：流式响应与 h2c
 
-> 状态：**Draft**，待评审后实现。
+> 状态：**Rust 侧（§三）与 h2c（§3.3）已实现**，Kotlin 侧（§四）与切引擎（§五）待做。
+> 实现中对本设计做了两处补充，见 §3.4。
 >
 > 目标：补齐 `STREAMING_RESPONSE` 与 `HTTP_2` 两项引擎能力
 > （Neton [HTTP 引擎能力规范](../../neton-docs/docs/zh-hans/spec/http-engine-capabilities.md)
@@ -131,6 +132,38 @@ hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
 
 > 不做 ALPN：那需要引擎持有证书。TLS 由 nginx 终止（已定）。
 
+### 3.4 实现时对本设计的两处补充
+
+**(a) 交付通道要能携带「流的开端」，v2 的同步快路径也要跟着改。**
+
+设计里没写这一条，但绕不过去：v2 的 `hyper4k_respond` 在回调内会走线程本地槽
+（`SYNC_RESPONSE`），而 `handle()` 返回的是单态的 `Response<Full<Bytes>>`。
+handler 在回调内联调用 `begin` 时（UNDISPATCHED 快路径下这很常见），
+槽里装的必须是「状态 + 头 + body 接收端」而不是一个已完成的响应。
+
+所以：oneshot 与线程本地槽的载荷都从 `ResponseData` 改为
+
+```rust
+enum Delivery { Buffered(ResponseData), Stream(StreamStart) }
+```
+
+响应体改为 `Hyper4kBody` 枚举（`Full` | `mpsc::Receiver`）而不是 `BoxBody`——
+一次性应答这条主路径保持单态、无动态分发，v2 的性能特征不变。
+流式分支的 `size_hint` 返回未知长度，hyper 据此自行选 chunked / DATA 帧。
+
+**(b) 新增 `HYPER4K_ERR_WOULD_BLOCK`（-6）。**
+
+§4.2 说的那个「最容易写错」的问题，Rust 侧现在会直接把它变成一个返回码，
+而不是让它退化成一次只在高并发下才看得见的 p99 劣化：
+
+`hyper4k_response_write` 在通道满、且当前线程属于某个 Tokio runtime 时，
+**不阻塞**，立即返回 `HYPER4K_ERR_WOULD_BLOCK`。
+（顺带解决一个致命问题：`blocking_send` 在 async 上下文里会 panic，
+而本 crate 以 `panic = "abort"` 编译——那等于进程直接死。）
+
+收到这个码 = 调用方把流式写入留在了引擎线程上，必须切调度器。
+§4.2 的约束因此从「文档里的口头约定」变成了 ABI 会拒绝的错误。
+
 ---
 
 ## 四、Kotlin 侧（neton-http-hyper4k）
@@ -198,3 +231,15 @@ override val capabilities = setOf(
 4. h2c：`curl --http2-prior-knowledge` 完成一次完整请求-响应
 5. 并发 100 条 SSE 时，普通请求 p99 延迟不劣化（验证 §4.2 没写错）
 6. `hyper4k_respond` 与流式三函数混用 → `HYPER4K_ERR_WRONG_STATE`，不 UB
+
+进度：第 2、3、4、6 条已由 `lib/src/lib.rs` 的单元测试在 Rust 层覆盖
+（`streams_first_event_before_last_event_is_produced`、
+`write_after_client_disconnect_reports_client_gone`、
+`accepts_http2_prior_knowledge_connections`、
+`oneshot_and_streaming_are_mutually_exclusive`）。
+第 1、5 条要等 Kotlin 侧 live response 落地后在一致性套件里跑。
+
+> 第 2 条那个测试值得说明它为什么不是时序巧合：handler 写完第 1 个事件后
+> 阻塞在一道闸门上，闸门只有在测试线程**确认收到**第 1 个事件之后才打开。
+> 所以「客户端已收到第 1 个事件，而最后一个事件尚未发出」是结构上成立的，
+> 不依赖 sleep。缓冲实现无法通过这个断言——这正是今天 SSE 静默失效的样子。

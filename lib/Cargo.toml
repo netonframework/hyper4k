@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
 hyper = { version = "1.11.1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.5"
 bytes = "1.12.1"
 dashmap = "6.2.1"
