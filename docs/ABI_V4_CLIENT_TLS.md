@@ -78,25 +78,33 @@ typedef struct { Hyper4kSlice name; Hyper4kSlice value; } Hyper4kHeader;
 **同步返回码统一为 `Hyper4kStatus`，数值冻结**。`new` / `send` / `cancel` /
 `resume` 全部返回它。数值一旦发布不得改动，新增只能追加。
 
+**所有跨 ABI 的枚举一律用固定宽度 `int32_t`，不用 C `enum`** —— `enum` 的底层
+宽度由编译器决定，跨 Rust / C / Kotlin/Native 三侧不能依赖默认布局。Rust 侧对应
+`#[repr(i32)]` 或直接用 `i32`。冻结数值而不冻结表示，等于没冻结。
+
 ```c
-typedef enum {
-    HYPER4K_OK                    = 0,
+typedef int32_t Hyper4kStatus;
 
-    /* 提交期参数与状态 */
-    HYPER4K_STATUS_ABI_MISMATCH   = -1,  /* abi_version 不兼容 */
-    HYPER4K_STATUS_STRUCT_SIZE    = -2,  /* struct_size 小于最小合法值 */
-    HYPER4K_STATUS_UNKNOWN_FLAGS  = -3,  /* flags 含未知位 */
-    HYPER4K_STATUS_INVALID_ARG    = -4,  /* NULL 指针、非法 URL / method / header */
-    HYPER4K_STATUS_UNSUPPORTED    = -5,  /* 如 http:// + HTTP2_REQUIRED */
-    HYPER4K_STATUS_CLIENT_CLOSED  = -6,
-    HYPER4K_STATUS_OOM            = -7,
+#define HYPER4K_OK                        ((Hyper4kStatus)  0)
 
-    /* cancel / resume 专用 */
-    HYPER4K_STATUS_NOT_FOUND      = -20, /* 无此 request_id */
-    HYPER4K_STATUS_ALREADY_DONE   = -21, /* 已到终态 */
-    HYPER4K_STATUS_NOT_PAUSED     = -22, /* resume 一个未暂停的请求 */
-} Hyper4kStatus;
+/* 提交期参数与状态 */
+#define HYPER4K_STATUS_ABI_MISMATCH       ((Hyper4kStatus) -1)  /* abi_version 不兼容 */
+#define HYPER4K_STATUS_STRUCT_SIZE        ((Hyper4kStatus) -2)  /* struct_size 小于最小合法值 */
+#define HYPER4K_STATUS_UNKNOWN_FLAGS      ((Hyper4kStatus) -3)  /* flags 含未知位 */
+#define HYPER4K_STATUS_INVALID_ARG        ((Hyper4kStatus) -4)  /* NULL 指针、非法 URL / method / header */
+#define HYPER4K_STATUS_UNSUPPORTED        ((Hyper4kStatus) -5)  /* 如 http:// + HTTP2_REQUIRED */
+#define HYPER4K_STATUS_CLIENT_CLOSED      ((Hyper4kStatus) -6)
+#define HYPER4K_STATUS_OOM                ((Hyper4kStatus) -7)  /* 真实分配失败 */
+#define HYPER4K_STATUS_RESOURCE_EXHAUSTED ((Hyper4kStatus) -8)  /* 主动限流，见 §2.5 */
+
+/* cancel / resume 专用 */
+#define HYPER4K_STATUS_NOT_FOUND          ((Hyper4kStatus)-20)  /* 无此 request_id */
+#define HYPER4K_STATUS_ALREADY_DONE       ((Hyper4kStatus)-21)  /* 已到终态 */
+#define HYPER4K_STATUS_NOT_PAUSED         ((Hyper4kStatus)-22)  /* resume 一个未暂停的请求 */
 ```
+
+`OOM` 与 `RESOURCE_EXHAUSTED` 不同：前者是分配器真的失败（`try_reserve` 之类），
+后者是我们**主动**拒绝以守住内存上限。把主动限流报成 OOM 会误导运维去查内存泄漏。
 
 `Hyper4kStatus` 是**同步**通道，`Hyper4kErrorKind`（§2.4）是**异步**通道。二者不
 重叠：提交期失败只出现在返回值里，不会再触发 `OnDone`；反之亦然。所以上一版那个
@@ -138,9 +146,18 @@ typedef struct {
 } Hyper4kClientOptions;
 
 /* 填入本版本默认值（含 max_retries = 2）。
-   没有它就无法区分"调用方要 0 次重试"和"调用方零初始化了结构体"。 */
-void hyper4k_client_options_init(Hyper4kClientOptions *opts);
+   没有它就无法区分"调用方要 0 次重试"和"调用方零初始化了结构体"。
+
+   **必须传入调用方实际分配的大小**：旧调用方按 v4.0 的较小结构体分配，运行时却
+   加载了追加过字段的 v4.1 库时，只有指针的版本会按新结构体大小写入而越界。
+   实现只写 min(struct_size, 本库已知大小)，并把结构体里的 struct_size 设为传入值。 */
+Hyper4kStatus hyper4k_client_options_init(Hyper4kClientOptions *opts,
+                                          uint32_t struct_size);
 ```
+
+`connect_timeout_ms = 0` 表示**禁用**连接超时（一直等到 OS 放弃），与
+`request_timeout_ms = 0` 同义。**不是**"用默认值"，也**不是**"立即超时" —— 这三种
+理解都有人持有，所以必须写死。想要默认值就用 `hyper4k_client_options_init()`。
 
 `request_timeout_ms = 0` 表示**禁用**总超时。SSE 这类长流必须能禁用它。
 
@@ -195,22 +212,22 @@ void hyper4k_client_free(Hyper4kClient *client);
 ```c
 /* 数值全部显式冻结，不依赖 C enum 自动递增 —— 中间插入一个成员就会
    平移后面所有值，而这些数字已经跨语言发出去了。 */
-typedef enum {
-    HYPER4K_ERR_NONE            = 0,
-    HYPER4K_ERR_DNS             = 1,
-    HYPER4K_ERR_CONNECT         = 2,
-    HYPER4K_ERR_TLS_CA          = 3,
-    HYPER4K_ERR_TLS_HOSTNAME    = 4,
-    HYPER4K_ERR_TLS_EXPIRED     = 5,
-    HYPER4K_ERR_TLS_OTHER       = 6,
-    HYPER4K_ERR_ALPN_NO_H2      = 7,
-    HYPER4K_ERR_PROTOCOL        = 8,
-    HYPER4K_ERR_TIMEOUT         = 9,
-    HYPER4K_ERR_IDLE_TIMEOUT    = 10,
-    HYPER4K_ERR_CANCELLED       = 11,  /* 含 close() 导致的取消 */
-    HYPER4K_ERR_TRUNCATED       = 12,  /* 响应已开始但未完整收到，见 §四 */
-    HYPER4K_ERR_OUTCOME_UNKNOWN = 13,  /* 见 §四，重试判定的唯一依据 */
-} Hyper4kErrorKind;
+typedef int32_t Hyper4kErrorKind;
+
+#define HYPER4K_ERR_NONE             ((Hyper4kErrorKind)  0)
+#define HYPER4K_ERR_DNS              ((Hyper4kErrorKind)  1)
+#define HYPER4K_ERR_CONNECT          ((Hyper4kErrorKind)  2)
+#define HYPER4K_ERR_TLS_CA           ((Hyper4kErrorKind)  3)
+#define HYPER4K_ERR_TLS_HOSTNAME     ((Hyper4kErrorKind)  4)
+#define HYPER4K_ERR_TLS_EXPIRED      ((Hyper4kErrorKind)  5)
+#define HYPER4K_ERR_TLS_OTHER        ((Hyper4kErrorKind)  6)
+#define HYPER4K_ERR_ALPN_NO_H2       ((Hyper4kErrorKind)  7)
+#define HYPER4K_ERR_PROTOCOL         ((Hyper4kErrorKind)  8)
+#define HYPER4K_ERR_TIMEOUT          ((Hyper4kErrorKind)  9)
+#define HYPER4K_ERR_IDLE_TIMEOUT     ((Hyper4kErrorKind) 10)
+#define HYPER4K_ERR_CANCELLED        ((Hyper4kErrorKind) 11)  /* 含 close() 导致的取消 */
+#define HYPER4K_ERR_TRUNCATED        ((Hyper4kErrorKind) 12)  /* 响应已开始但未完整收到，见 §四 */
+#define HYPER4K_ERR_OUTCOME_UNKNOWN  ((Hyper4kErrorKind) 13)  /* 见 §四，重试判定的唯一依据 */
 ```
 
 上一版的 `HYPER4K_ERR_CLIENT_CLOSED` 已删除：提交期关闭走同步
@@ -244,16 +261,14 @@ typedef struct {
 
 /* 两种动作类型分开：headers 阶段没有"暂停下一块"的语义，
    合成一个枚举会留下一个未定义的 OnHeaders+PAUSE 组合。 */
-typedef enum {
-    HYPER4K_HEADERS_CONTINUE = 0,
-    HYPER4K_HEADERS_CANCEL   = 2,
-} Hyper4kHeadersAction;
+typedef int32_t Hyper4kHeadersAction;
+#define HYPER4K_HEADERS_CONTINUE ((Hyper4kHeadersAction) 0)
+#define HYPER4K_HEADERS_CANCEL   ((Hyper4kHeadersAction) 2)
 
-typedef enum {
-    HYPER4K_CHUNK_CONTINUE = 0,
-    HYPER4K_CHUNK_PAUSE    = 1,
-    HYPER4K_CHUNK_CANCEL   = 2,
-} Hyper4kChunkAction;
+typedef int32_t Hyper4kChunkAction;
+#define HYPER4K_CHUNK_CONTINUE   ((Hyper4kChunkAction) 0)
+#define HYPER4K_CHUNK_PAUSE      ((Hyper4kChunkAction) 1)
+#define HYPER4K_CHUNK_CANCEL     ((Hyper4kChunkAction) 2)
 
 /* version: 1 = HTTP/1.1, 2 = HTTP/2。AUTO 协商下调用方靠它观测实际结果。 */
 typedef Hyper4kHeadersAction (*Hyper4kOnHeaders)(void *ud, uint64_t request_id,
@@ -296,13 +311,18 @@ chunk** —— 否则调用方必须自己去重，那等于把背压的复杂�
 但"每请求一条有界队列"**还不足以**保证隔离，必须同时约束三件事：
 
 - **client 级总内存上限。** 每请求队列各自有界，N 个请求叠加仍可无界增长。超过
-  上限时拒绝新请求（`HYPER4K_STATUS_OOM`），而不是继续吃内存。
+  上限时拒绝新请求（`HYPER4K_STATUS_RESOURCE_EXHAUSTED` —— 主动限流，不是 `OOM`），
+  而不是继续吃内存。
 - **bridge executor 公平调度。** 就绪的请求轮转投递，不能让一个高吞吐 stream 饿死
   其他 stream。
-- **HTTP/2 connection window 的处理。** 大量 PAUSED stream 会把**连接级**窗口耗
-  尽，届时连未暂停的 stream 也读不动 —— 这是 stream 级流控挡不住的。实现必须监测
-  连接窗口占用；同一连接上 PAUSED stream 超过阈值时，新请求改用新连接，避免一条
-  连接被拖死。
+- **HTTP/2 connection window 预留不变式。** 大量 PAUSED stream 会把**连接级**窗口
+  耗尽，届时连未暂停的 stream 也读不动 —— 这是 stream 级流控挡不住的。仅仅把
+  "后续新请求"切到新连接**不够**：已经在这条连接上的活跃流照样被拖死。必须维持
+
+  > connection window ≥ (每连接允许的 PAUSED stream 上限 × 单流最大占用)
+  >                     + 活跃流的保留容量
+
+  实现据此限制每连接的 PAUSED stream 数；达到上限时新请求才改用新连接。
 
 `OnDone` 对每个**已被接受**的请求**恰好一次**；其后不再有该 id 的任何回调。
 
@@ -325,8 +345,10 @@ typedef struct {
 
 /* 必须提供：零初始化的 request 会让 read_idle_timeout_ms = 0，
    在不知情的情况下把"继承 client 缺省"变成"禁用空闲超时"。
-   至少设置 abi_version、struct_size、read_idle_timeout_ms = UINT64_MAX。 */
-void hyper4k_client_request_init(Hyper4kClientRequest *request);
+   至少设置 abi_version、struct_size、read_idle_timeout_ms = UINT64_MAX。
+   struct_size 语义同 hyper4k_client_options_init。 */
+Hyper4kStatus hyper4k_client_request_init(Hyper4kClientRequest *request,
+                                          uint32_t struct_size);
 ```
 
 request 同样有**最小合法 `struct_size`**（到 `url` 为止），小于即
@@ -538,6 +560,15 @@ Rust 侧自动化测试，全部用本地生成的 CA 与证书：
 36. 大量 PAUSED stream 不会耗尽连接级窗口而拖死同连接的活跃 stream
 37. client 级总内存上限生效：超限时新请求得到 `HYPER4K_STATUS_OOM`，进程不 OOM
 38. `Hyper4kErrorKind` 各值与文档一致（跨语言常量比对，不靠自动递增）
+39. **跨版本结构体兼容双向验证**：
+    - 旧的小结构体调用新库：`*_init(ptr, sizeof(old_struct))` 只写前缀，不越界
+    - 新的大结构体调用旧库：尾部字段保持调用方预置值，旧库不误读
+40. `HYPER4K_STATUS_RESOURCE_EXHAUSTED` 与 `HYPER4K_STATUS_OOM` 分别可触发且不混淆
+41. 连接窗口预留不变式成立：把每连接 PAUSED stream 加到上限后，**同连接上的活跃
+    stream 仍能正常读取**（仅验证"新请求走新连接"不足以证明这一点）
+42. `connect_timeout_ms = 0` 行为是禁用而非默认值或立即超时
+43. 所有跨 ABI 类型宽度为 4 字节：`static_assert(sizeof(Hyper4kStatus) == 4)` 等，
+    Rust 与 Kotlin 侧各断言一次
 
 APNs 真凭据 smoke 作为**可选外部测试**，不进普通单测。
 
