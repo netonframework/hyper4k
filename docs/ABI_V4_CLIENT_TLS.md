@@ -59,19 +59,9 @@ uint64_t hyper4k_client_capabilities(void);
 
 **只定义已经实现且有测试的位**，不预留猜测性能力。位一旦发出去含义就冻结。
 
-配置结构体一律 `abi_version` + `struct_size` 前置，新增字段追加在尾部：
-
-```c
-typedef struct {
-    uint32_t       abi_version;
-    uint32_t       struct_size;
-    uint64_t       flags;              /* HYPER4K_CLIENT_HTTP2_REQUIRED 等 */
-    uint64_t       connect_timeout_ms;
-    uint64_t       request_timeout_ms;
-    const uint8_t *custom_ca_pem;      /* NULL = 只用系统根证书 */
-    size_t         custom_ca_pem_len;
-} Hyper4kClientOptions;
-```
+所有配置结构体一律 `abi_version` + `struct_size` 前置，新增字段只能追加在尾部。
+规范定义见 §2.2（options）与 §2.6（request）—— **全文各只有一份**，不得在别处
+重复给出结构体定义。
 
 ### 2.1 类型、状态码与常量
 
@@ -203,17 +193,31 @@ void hyper4k_client_free(Hyper4kClient *client);
 定义在回调之前，回调签名才能引用它。
 
 ```c
+/* 数值全部显式冻结，不依赖 C enum 自动递增 —— 中间插入一个成员就会
+   平移后面所有值，而这些数字已经跨语言发出去了。 */
 typedef enum {
-    HYPER4K_ERR_NONE = 0,
-    HYPER4K_ERR_DNS,              HYPER4K_ERR_CONNECT,
-    HYPER4K_ERR_TLS_CA,           HYPER4K_ERR_TLS_HOSTNAME,
-    HYPER4K_ERR_TLS_EXPIRED,      HYPER4K_ERR_TLS_OTHER,
-    HYPER4K_ERR_ALPN_NO_H2,       HYPER4K_ERR_PROTOCOL,
-    HYPER4K_ERR_TIMEOUT,          HYPER4K_ERR_IDLE_TIMEOUT,
-    HYPER4K_ERR_CANCELLED,        HYPER4K_ERR_CLIENT_CLOSED,
-    HYPER4K_ERR_TRUNCATED,        /* 响应已开始但未完整收到，见 §四 */
-    HYPER4K_ERR_OUTCOME_UNKNOWN,  /* 见 §四，重试判定的唯一依据 */
+    HYPER4K_ERR_NONE            = 0,
+    HYPER4K_ERR_DNS             = 1,
+    HYPER4K_ERR_CONNECT         = 2,
+    HYPER4K_ERR_TLS_CA          = 3,
+    HYPER4K_ERR_TLS_HOSTNAME    = 4,
+    HYPER4K_ERR_TLS_EXPIRED     = 5,
+    HYPER4K_ERR_TLS_OTHER       = 6,
+    HYPER4K_ERR_ALPN_NO_H2      = 7,
+    HYPER4K_ERR_PROTOCOL        = 8,
+    HYPER4K_ERR_TIMEOUT         = 9,
+    HYPER4K_ERR_IDLE_TIMEOUT    = 10,
+    HYPER4K_ERR_CANCELLED       = 11,  /* 含 close() 导致的取消 */
+    HYPER4K_ERR_TRUNCATED       = 12,  /* 响应已开始但未完整收到，见 §四 */
+    HYPER4K_ERR_OUTCOME_UNKNOWN = 13,  /* 见 §四，重试判定的唯一依据 */
 } Hyper4kErrorKind;
+```
+
+上一版的 `HYPER4K_ERR_CLIENT_CLOSED` 已删除：提交期关闭走同步
+`HYPER4K_STATUS_CLIENT_CLOSED`，已接受请求被 `close()` 终止时走
+`HYPER4K_ERR_CANCELLED`，它没有任何产生路径。
+
+```c
 
 typedef struct {
     int32_t      kind;          /* Hyper4kErrorKind，稳定分类 */
@@ -238,20 +242,27 @@ typedef struct {
    异常：不得跨越 C ABI —— crate 是 panic = "abort"，穿过去就是 UB。
         Kotlin wrapper 在边界捕获后，返回 CANCEL 即可终止该请求。 */
 
+/* 两种动作类型分开：headers 阶段没有"暂停下一块"的语义，
+   合成一个枚举会留下一个未定义的 OnHeaders+PAUSE 组合。 */
 typedef enum {
-    HYPER4K_ACTION_CONTINUE = 0,
-    HYPER4K_ACTION_PAUSE    = 1,  /* 仅 OnChunk 有意义 */
-    HYPER4K_ACTION_CANCEL   = 2,
-} Hyper4kAction;
+    HYPER4K_HEADERS_CONTINUE = 0,
+    HYPER4K_HEADERS_CANCEL   = 2,
+} Hyper4kHeadersAction;
+
+typedef enum {
+    HYPER4K_CHUNK_CONTINUE = 0,
+    HYPER4K_CHUNK_PAUSE    = 1,
+    HYPER4K_CHUNK_CANCEL   = 2,
+} Hyper4kChunkAction;
 
 /* version: 1 = HTTP/1.1, 2 = HTTP/2。AUTO 协商下调用方靠它观测实际结果。 */
-typedef Hyper4kAction (*Hyper4kOnHeaders)(void *ud, uint64_t request_id,
-                                          uint16_t status, uint8_t version,
-                                          const Hyper4kHeader *headers,
-                                          size_t header_count);
+typedef Hyper4kHeadersAction (*Hyper4kOnHeaders)(void *ud, uint64_t request_id,
+                                                 uint16_t status, uint8_t version,
+                                                 const Hyper4kHeader *headers,
+                                                 size_t header_count);
 
-typedef Hyper4kAction (*Hyper4kOnChunk)(void *ud, uint64_t request_id,
-                                        const uint8_t *ptr, size_t len);
+typedef Hyper4kChunkAction (*Hyper4kOnChunk)(void *ud, uint64_t request_id,
+                                             const uint8_t *ptr, size_t len);
 
 typedef void (*Hyper4kOnDone)(void *ud, uint64_t request_id,
                               const Hyper4kError *error);  /* NULL = 成功 */
@@ -266,13 +277,32 @@ Rust —— 阻塞它会占住 bridge worker，立即返回又会在 Kotlin 侧�
 `PAUSE` 的语义**固定为「当前 chunk 已消费，暂停下一块」**。恢复后**不得重发当前
 chunk** —— 否则调用方必须自己去重，那等于把背压的复杂度推给了每一个使用者。
 
-**`resume()` 早于 PAUSE 落地不得丢失唤醒。** `PAUSE` 从回调返回到 Rust 真正挂起
-之间有一个窗口，此时 Kotlin 可能已经消费完并调用 `resume()`。实现必须用 permit
-（或状态代际）记住这次提前恢复，使随后的挂起立即被解除。丢失唤醒会让 stream 永久
-卡死，且只在高吞吐下偶发 —— 这类 bug 极难定位，必须在设计层排除。
+**`resume()` 早于 PAUSE 落地不得丢失唤醒，但 permit 只属于当前 chunk。** `PAUSE`
+从回调返回到 Rust 真正挂起之间有一个窗口，Kotlin 可能已经消费完并调用
+`resume()`。丢失唤醒会让 stream 永久卡死，且只在高吞吐下偶发；而 permit 若被留到
+以后，又会错误解除未来某次暂停。两种失败都必须在设计层排除，语义冻结为：
+
+| `resume()` 调用时机 | 返回 | permit 处理 |
+|---|---|---|
+| 当前 chunk 回调仍在执行中 | `HYPER4K_OK` | 记下 permit，**只属于本次 chunk** |
+| 该回调随后返回 `PAUSE` | —— | **立即消费 permit**，不真正挂起 |
+| 该回调随后返回 `CONTINUE` / `CANCEL` | —— | **丢弃 permit**，绝不影响以后任何 chunk |
+| 请求确实处于暂停态 | `HYPER4K_OK` | 解除挂起 |
+| 既无回调执行中，也未暂停 | `HYPER4K_STATUS_NOT_PAUSED` | —— |
 
 **每个 request 一条独立的有界队列**，不是每个 client 一条。共用一条时慢 stream 会
 堵住同连接的其他 stream。
+
+但"每请求一条有界队列"**还不足以**保证隔离，必须同时约束三件事：
+
+- **client 级总内存上限。** 每请求队列各自有界，N 个请求叠加仍可无界增长。超过
+  上限时拒绝新请求（`HYPER4K_STATUS_OOM`），而不是继续吃内存。
+- **bridge executor 公平调度。** 就绪的请求轮转投递，不能让一个高吞吐 stream 饿死
+  其他 stream。
+- **HTTP/2 connection window 的处理。** 大量 PAUSED stream 会把**连接级**窗口耗
+  尽，届时连未暂停的 stream 也读不动 —— 这是 stream 级流控挡不住的。实现必须监测
+  连接窗口占用；同一连接上 PAUSED stream 超过阈值时，新请求改用新连接，避免一条
+  连接被拖死。
 
 `OnDone` 对每个**已被接受**的请求**恰好一次**；其后不再有该 id 的任何回调。
 
@@ -292,6 +322,28 @@ typedef struct {
        上一版用 0 表示继承，导致 SSE 无法显式关掉空闲超时。 */
     uint64_t             read_idle_timeout_ms;
 } Hyper4kClientRequest;
+
+/* 必须提供：零初始化的 request 会让 read_idle_timeout_ms = 0，
+   在不知情的情况下把"继承 client 缺省"变成"禁用空闲超时"。
+   至少设置 abi_version、struct_size、read_idle_timeout_ms = UINT64_MAX。 */
+void hyper4k_client_request_init(Hyper4kClientRequest *request);
+```
+
+request 同样有**最小合法 `struct_size`**（到 `url` 为止），小于即
+`HYPER4K_STATUS_STRUCT_SIZE`。
+
+**NULL 规则**（违反一律 `HYPER4K_STATUS_INVALID_ARG`）：
+
+| 参数 | 可否为 NULL |
+|---|---|
+| `client` / `request` / `out_request_id` | 否 |
+| `on_headers` / `on_done` | 否 |
+| `on_chunk` | **可以** —— 表示丢弃响应体，仅要状态与 headers |
+| `user_data` | 可以，原样回传 |
+| `headers`（`header_count = 0` 时） | 可以 |
+| `body_ptr`（`body_len = 0` 时） | 可以 |
+
+```c
 
 /* **返回前绝不触发任何回调**，且已复制 method / url / headers / body 全部输入
    切片 —— 返回后调用方缓冲即可释放。 */
@@ -469,12 +521,23 @@ Rust 侧自动化测试，全部用本地生成的 CA 与证书：
 26. `send()` 与 `close()` 并发：结果只能是同步 `CLIENT_CLOSED` 或恰好一次
     `OnDone`，不存在既不返回错误也无回调的中间态
 27. 从**回调线程**调用 `cancel` / `resume` / `close` 不死锁
-28. 透明重试期间 `request_id` 不变；旧 generation 的排队回调不投递（构造
-    "headers 已入队但未投递时连接中断"的场景验证不出现重复 headers）
+28. 重试边界的两个场景必须分别验证，结论相反：
+    - **尚无任何响应数据入队时断线** → 透明重试，`request_id` 不变，旧 generation
+      的传输事件不得泄漏给 Kotlin
+    - **headers 已入队但尚未投递时断线** → **不重试**；那份 headers 也不投递；
+      最终只有一次 `OnDone(TRUNCATED)`
 29. `Hyper4kStatus` 各值与文档一致；`struct_size` 小于最小合法值被拒绝
 30. `hyper4k_client_options_init()` 填出的默认值可区分于零初始化
 31. `read_idle_timeout_ms` 三种取值（继承 / 禁用 / 覆盖）行为符合定义
 32. `OnHeaders` 报告的 `version` 与实际协商结果一致
+33. permit 归属：提前 `resume()` 在回调返回 `CONTINUE` / `CANCEL` 后被丢弃，
+    **不影响以后任何一次 pause**；返回 `PAUSE` 时被立即消费
+34. `hyper4k_client_request_init()` 填出的默认可区分于零初始化；request 的
+    最小 `struct_size` 被强制
+35. `on_chunk = NULL` 时正常收到 headers 与 `OnDone`，响应体被丢弃
+36. 大量 PAUSED stream 不会耗尽连接级窗口而拖死同连接的活跃 stream
+37. client 级总内存上限生效：超限时新请求得到 `HYPER4K_STATUS_OOM`，进程不 OOM
+38. `Hyper4kErrorKind` 各值与文档一致（跨语言常量比对，不靠自动递增）
 
 APNs 真凭据 smoke 作为**可选外部测试**，不进普通单测。
 
