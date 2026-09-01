@@ -1,98 +1,120 @@
 # hyper4k
 
-高性能 **Tokio + Hyper** HTTP 引擎，通过借用切片 C ABI 暴露，作为 Neton（Kotlin/Native）Web 框架的原生底座。
+High-performance **Tokio + Hyper** HTTP engine, exposed through a borrowed-slice C ABI as the
+native foundation of the Neton (Kotlin/Native) web framework.
 
-> 设计原则：hyper4k 只做**协议与传输**（accept / parse / body / 写回 / 连接生命周期）。
-> 路由、中间件、handler 全部留在 Neton（Kotlin）侧。Hyper 永远不碰路由表。
+[中文文档](README.zh-Hans.md)
 
-## 分层
+> Design rule: hyper4k does **protocol and transport only** (accept / parse / body / write-back /
+> connection lifecycle). Routing, middleware and handlers all stay on the Neton (Kotlin) side.
+> Hyper never touches the route table.
+
+## Layering
 
 ```
-hyper4k (Rust crate, lib/)   Tokio runtime + Hyper 协议引擎 + C ABI
+hyper4k (Rust crate, lib/)   Tokio runtime + Hyper protocol engine + C ABI
    ↓ cinterop
-hyper4k (Kotlin/Native 项目)   可复用的封装（Hyper4kServer / Request / Response）
-   ↓ 依赖
-neton-http-hyper4k             可选 Neton Adapter，接进 RouteMatcher / RequestEngine
+hyper4k (Kotlin/Native)      Reusable wrapper (Hyper4kServer / Request / Response)
+   ↓ dependency
+neton-http-hyper4k           Neton adapter, wired into RouteMatcher / RequestEngine
 ```
 
-hyper4k 本身是一个 Kotlin/Native 项目，Rust 引擎作为 `lib/` 子目录内嵌：
+hyper4k is itself a Kotlin/Native project, with the Rust engine embedded as the `lib/` subdirectory:
 
 ```
 hyper4k/
   README.md
-  build.gradle.kts            Kotlin/Native 模块（cinterop 封装）
+  build.gradle.kts            Kotlin/Native module (cinterop wrapper)
   src/                        commonMain / nativeMain / nativeInterop
-  lib/                        Rust crate：Cargo.toml, cbindgen.toml, src/lib.rs, include/hyper4k.h
+  lib/                        Rust crate: Cargo.toml, cbindgen.toml, src/lib.rs, include/hyper4k.h
 ```
 
-- `lib/Cargo.toml` / `lib/src/lib.rs` —— Rust crate
-- `lib/include/hyper4k.h` —— C ABI（契约与线程模型注释都在这里）
-- `build.gradle.kts` / `src/` —— Kotlin/Native 封装（独立可复用，不依赖 Neton）
+- `lib/Cargo.toml` / `lib/src/lib.rs` — the Rust crate
+- `lib/include/hyper4k.h` — the C ABI (contract and threading notes live here)
+- `build.gradle.kts` / `src/` — the Kotlin/Native wrapper (reusable on its own, no Neton dependency)
 
-## C ABI 速览
+## C ABI at a glance
 
 ```c
-Hyper4kServer* hyper4k_server_start(host, port, on_request, user_data);  // 绑定失败返回 NULL
-int32_t        hyper4k_respond(responder, status, headers_ptr,len, body_ptr,len); // 成功返回 1
+Hyper4kServer* hyper4k_server_start(host, port, on_request, user_data);   // NULL when the bind fails
+int32_t        hyper4k_respond(responder, status, headers_ptr,len, body_ptr,len);  // 1 on success
 void           hyper4k_server_stop(server);
+
+/* Streaming responses: begin, then write chunks, then finish. */
+int32_t        hyper4k_response_begin(responder, status, headers_ptr, len);
+int32_t        hyper4k_response_write(responder, chunk_ptr, len);
+int32_t        hyper4k_response_finish(responder);
 ```
 
-线程模型（push）：`on_request` 在 Tokio worker 线程上被调用，语义上应尽快返回，之后
-（可在另一线程）调用 `hyper4k_respond` 完成该请求。Kotlin 封装会在回调内复制请求快照，
-然后交给受管协程执行 `suspend` handler。响应句柄是单次数字 token；请求已取消或已经响应时，
-迟到调用安全返回 0。crate 以 `panic = "abort"` 编译，保证 panic 不跨 FFI。
+Threading model (push): `on_request` is called on a Tokio worker thread and should return quickly;
+`hyper4k_respond` completes the request afterwards, possibly from another thread. The Kotlin wrapper
+copies a request snapshot inside the callback and hands it to a managed coroutine that runs the
+`suspend` handler. The response handle is a single-use numeric token, so a late call after the
+request was cancelled or already answered fails safely instead of touching freed memory. The crate
+is built with `panic = "abort"` so a panic never crosses the FFI boundary.
 
-默认并发是有界的：达到上限立即返回 503，单请求超过 deadline 返回 504。停止时先停止接收
-新任务、等待在途 handler 到达 grace deadline，再关闭 Tokio。不存在同步 handoff 开关。
+Concurrency is bounded by default: past the limit the server answers 503 immediately, and a request
+over its deadline gets 504. Shutdown stops accepting new work, waits for in-flight handlers up to the
+grace deadline, then shuts Tokio down. There is no synchronous-handoff switch.
 
-## 构建 Rust crate
+## Building the Rust crate
 
-需要本机 Rust 工具链。在 `lib/` 目录下逐 target 产出 `libhyper4k.a`：
+Needs a local Rust toolchain. Produce `libhyper4k.a` per target from `lib/`:
 
 ```bash
 cd lib
 
-# 本机
+# Host
 cargo build --release
 
-# 指定 target（K/Native target -> Rust triple）
+# Explicit target (Kotlin/Native target -> Rust triple)
 rustup target add aarch64-apple-darwin
-cargo build --release --target aarch64-apple-darwin     # macosArm64
-cargo build --release --target x86_64-apple-darwin      # macosX64
-cargo build --release --target x86_64-unknown-linux-gnu # linuxX64
-cargo build --release --target aarch64-unknown-linux-gnu# linuxArm64
-cargo build --release --target x86_64-pc-windows-gnu    # mingwX64
+cargo build --release --target aarch64-apple-darwin      # macosArm64
+cargo build --release --target x86_64-apple-darwin       # macosX64
+cargo build --release --target x86_64-unknown-linux-gnu  # linuxX64
+cargo build --release --target aarch64-unknown-linux-gnu # linuxArm64
+cargo build --release --target x86_64-pc-windows-gnu     # mingwX64
 ```
 
-跨平台交叉编译推荐 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)：
-`cargo zigbuild --release --target <triple>`。产物在 `lib/target/<triple>/release/libhyper4k.a`。
+For cross-compiling, [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) is the easiest
+route: `cargo zigbuild --release --target <triple>`. Artifacts land in
+`lib/target/<triple>/release/libhyper4k.a`.
 
-运行 Rust 验证：
+Release builds must resolve dependencies from the committed lockfile:
+
+```bash
+cargo build --release --locked
+```
+
+Rust checks:
 
 ```bash
 cd lib
 cargo fmt --all -- --check
-cargo test --all-targets
+cargo test --all-targets --locked
 cargo clippy --all-targets -- -D warnings
 ```
 
-## 构建 Kotlin/Native 封装
+## Building the Kotlin/Native wrapper
 
-根目录的 `build.gradle.kts` 已配置：5 个 K/Native target、按 target 注入 `libhyper4k.a`
-路径的 cinterop、各平台链接所需系统库，以及便捷的 `cargoBuild<Target>` 任务。
+The root `build.gradle.kts` already covers it: five Kotlin/Native targets, per-target cinterop that
+injects the matching `libhyper4k.a` path, the system libraries each platform needs to link, and
+convenience `cargoBuild<Target>` tasks.
 
-本机 Kotlin/Native 验证：
+Host verification:
 
 ```bash
 ./gradlew macosArm64Test
 ```
 
-其他平台使用对应的 `<target>Test` 任务。Gradle 会先构建相同 target 的 Rust 静态库。
+Other platforms use their own `<target>Test` task. Gradle builds the Rust static library for the
+same target first.
 
-## 接入 Neton
+## Using it from Neton
 
-Neton 默认只包含 Ktor Adapter。独立的 `neton-http-hyper4k` 仓库负责 Neton 集成，
-应用引入后把 Adapter 构造器直接传给 HTTP Component：
+`neton-http-hyper4k` is a module of the Neton repository and is Neton's default server engine: the
+bare `http { }` DSL resolves to `Hyper4kHttpAdapter` as soon as an application depends on that
+module. Naming the adapter explicitly is equivalent and works the same way:
 
 ```kotlin
 import neton.http.hyper4k.Hyper4kHttpAdapter
@@ -102,37 +124,38 @@ Neton.run(args) {
 }
 ```
 
-`hyper4k` 本身不依赖 Neton；`neton-http-hyper4k` 才负责 routing、security、parameter
-binding 和 response envelope。Adapter 选择属于编译期应用代码，不使用 `http.engine`
-配置或运行时 Provider 注册；未引入 Hyper Adapter 的应用不会链接 Rust/FFI 产物。
+`hyper4k` itself does not depend on Neton; `neton-http-hyper4k` is what supplies routing, security,
+parameter binding and the response envelope. Engine choice is compile-time application code — there
+is no `http.engine` setting and no runtime provider registry — so an application that never depends
+on the adapter never links the Rust/FFI artifacts.
 
-## 压测对比
+## Benchmarking
 
-启动两套各跑一遍，同条件对比：
+Run both sides under identical conditions:
 
 ```bash
-# 安装压测工具
-#   wrk:   https://github.com/wg/wrk
+# Load tools
+#   wrk:        https://github.com/wg/wrk
 #   bombardier: go install github.com/codesenberg/bombardier@latest
 
-# 小 JSON（Rust 收益最大的场景）
+# Small JSON (where Rust gains the most)
 wrk -t4 -c128 -d30s http://127.0.0.1:8080/health
 bombardier -c 128 -d 30s http://127.0.0.1:8080/health
 ```
 
-关注：RPS、p50/p99 延迟、连接建立开销。建议先用 echo/health 路由量出**纯传输层**差距，
-再加业务 handler 量端到端差距。AI gateway 这类 I/O 密集、长流式场景，瓶颈在上游延迟，
-Rust 底座收益最小——别用它来判断是否值得迁移。
+Watch RPS, p50/p99 latency, and connection setup cost. Measure the **pure transport** gap with an
+echo/health route first, then add a business handler for the end-to-end gap. For I/O-bound, long
+streaming workloads such as an AI gateway the bottleneck is upstream latency and the Rust foundation
+gains the least — do not use that shape to decide whether a migration is worth it.
 
-## 路线图
+## Roadmap
 
-- [x] v1：单请求聚合 body 打通（method/path/headers/body + 写回）
+- [x] v1: single request with aggregated body (method/path/headers/body + write-back)
 - [x] Hyper4kHttpAdapter JSON / form / security / CORS request pipeline
-- [x] 异步 handoff：回调复制请求后立即返回，Kotlin/Native 协程处理 suspend handler
-- [x] 有界并发、请求超时与优雅停止
+- [x] Async handoff: the callback copies the request and returns; a Kotlin/Native coroutine runs the suspend handler
+- [x] Bounded concurrency, request timeouts and graceful shutdown
 - [ ] Multipart upload support
-- [x] 流式 body / SSE relay（真 socket 分块测试把关，缓冲实现会让构建失败）
-- [x] HTTP/2 prior-knowledge（h2c）：真实 client handshake + 请求派发 + 同连接并发 stream
-- [ ] HTTP/2 over TLS（ALPN 协商，随 TLS 能力一并）
-- [ ] 可选 `hyper4k-tower`：接入 Tower 生态（timeout / trace / load-shed）
-```
+- [x] Streaming body / SSE relay (guarded by a real-socket chunking test; a buffered implementation fails the build)
+- [x] HTTP/2 prior knowledge (h2c): real client handshake, request dispatch, concurrent streams on one connection
+- [ ] HTTP/2 over TLS (ALPN negotiation, together with TLS support)
+- [ ] Optional `hyper4k-tower`: Tower ecosystem integration (timeout / trace / load-shed)
