@@ -27,24 +27,24 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// 流式 body 通道容量。取小值：容量大只是把内存堆在 Rust 侧，
-/// 并不能让慢客户端变快，反而掩盖背压（设计 §3.2）。
+/// Streaming body channel capacity. Kept small: a bigger buffer only piles bytes
+/// up on the Rust side instead of letting backpressure reach the writer.
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 
 // ---------------------------------------------------------------------------
-// ABI v3 返回码
+// ABI v3 return codes
 // ---------------------------------------------------------------------------
 
-/// 操作成功。与 v2 `hyper4k_respond` 的「已交付」返回值一致。
+/// Success. Same value as v2 `hyper4k_respond`'s "delivered".
 pub const HYPER4K_OK: i32 = 1;
-/// responder 已失效或已完成（v2 语义保留）。
+/// Responder is stale or already completed (v2 semantics).
 pub const HYPER4K_FAILED: i32 = 0;
-/// responder 当前状态不允许该操作（如一次性应答与流式混用）。
+/// The responder's state does not allow this call (one-shot mixed with streaming).
 pub const HYPER4K_ERR_WRONG_STATE: i32 = -4;
-/// 客户端已断开：停止产生数据并 finish 收尾。不是错误路径。
+/// Client is gone: stop producing data and call finish. Not an error path.
 pub const HYPER4K_ERR_CLIENT_GONE: i32 = -5;
-/// 本次写入需要阻塞，但调用线程是引擎线程，阻塞它会拖垮整个 runtime。
-/// 调用方 MUST 把流式写入切到可阻塞的调度器（设计 §4.2）。
+/// The write needs to block but the caller is an engine thread. Streaming writes
+/// must run on a dispatcher where blocking is safe.
 pub const HYPER4K_ERR_WOULD_BLOCK: i32 = -6;
 
 // ---------------------------------------------------------------------------
@@ -99,20 +99,20 @@ struct ResponseData {
     body: Vec<u8>,
 }
 
-/// 流式响应的起始信息：状态行 + 头立即发出，body 由 `rx` 后续供给。
+/// Head of a streaming response: status and headers go out now, body arrives over `rx`.
 struct StreamStart {
     status: u16,
     headers: Vec<(String, String)>,
     rx: mpsc::Receiver<Bytes>,
 }
 
-/// 交给连接协程的东西：要么是一次性应答，要么是一条流的开端。
+/// What the connection task receives: a finished response, or the head of a stream.
 enum Delivery {
     Buffered(ResponseData),
     Stream(StreamStart),
 }
 
-/// 响应体。用枚举而非 `BoxBody`，让一次性应答这条主路径保持单态、无动态分发。
+/// Response body. An enum rather than `BoxBody` so the one-shot path stays monomorphic.
 pub struct Hyper4kBody(BodyKind);
 
 enum BodyKind {
@@ -140,7 +140,7 @@ impl Body for Hyper4kBody {
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
         match &mut self.get_mut().0 {
             BodyKind::Full(full) => Pin::new(full).poll_frame(cx),
-            // 发送端全部 drop（finish 或 handler 泄漏）时 recv 返回 None -> 流正常结束。
+            // recv yields None once every sender is dropped, which ends the stream.
             BodyKind::Stream(rx) => rx
                 .poll_recv(cx)
                 .map(|chunk| chunk.map(|bytes| Ok(Frame::data(bytes)))),
@@ -156,9 +156,9 @@ impl Body for Hyper4kBody {
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         match &self.0 {
-            // 已知长度 -> hyper 发 Content-Length。
+            // Known length: hyper emits Content-Length.
             BodyKind::Full(full) => full.size_hint(),
-            // 长度未知 -> hyper 自行选择 chunked(HTTP/1.1) 或 DATA 帧(HTTP/2)。
+            // Unknown length: hyper picks chunked (HTTP/1.1) or DATA frames (HTTP/2).
             BodyKind::Stream(_) => hyper::body::SizeHint::default(),
         }
     }
@@ -166,8 +166,8 @@ impl Body for Hyper4kBody {
 
 static NEXT_RESPONDER_ID: AtomicU64 = AtomicU64::new(1);
 static PENDING_RESPONSES: OnceLock<DashMap<u64, oneshot::Sender<Delivery>>> = OnceLock::new();
-/// 已进入流式状态的 responder：id -> body 写入端。
-/// 条目存在即表示该 responder 处于 Streaming 态，是状态机的唯一真相来源。
+/// Responders that have entered streaming: id -> body sender. Presence in this
+/// map is the single source of truth for the Streaming state.
 static ACTIVE_STREAMS: OnceLock<DashMap<u64, mpsc::Sender<Bytes>>> = OnceLock::new();
 
 // ABI v2 同步快路径：回调在 Tokio worker 线程上执行，若 handler 在回调内同步完成，
@@ -181,7 +181,7 @@ fn take_sync_response() -> Option<Delivery> {
     SYNC_RESPONSE.with(|slot| slot.borrow_mut().take())
 }
 
-/// 尝试把同步交付写入线程本地槽；槽已被占用（重复响应）时返回 false。
+/// Parks a delivery in the thread-local slot; false if the slot is already taken.
 fn set_sync_response(delivery: Delivery) -> bool {
     SYNC_RESPONSE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -237,7 +237,7 @@ fn error_response(status: u16, message: &'static [u8]) -> Response<Hyper4kBody> 
         .expect("static error response must build")
 }
 
-/// 由一次交付构造 hyper 响应。
+/// Builds the hyper response for one delivery.
 fn build_response(delivery: Delivery) -> Response<Hyper4kBody> {
     let (status, headers, body) = match delivery {
         Delivery::Buffered(data) => (
@@ -248,7 +248,7 @@ fn build_response(delivery: Delivery) -> Response<Hyper4kBody> {
         Delivery::Stream(start) => (
             start.status,
             start.headers,
-            // 不设 Content-Length：size_hint 为未知，hyper 自行选 chunked / DATA 帧。
+            // No Content-Length: size_hint is unknown, so hyper frames the body itself.
             Hyper4kBody::stream(start.rx),
         ),
     };
@@ -321,8 +321,8 @@ async fn handle(
     IN_CALLBACK.set(false);
 
     let delivery = match take_sync_response() {
-        // 同步路径：通道注册条目由 _pending 守卫在 handle 结束时清理，
-        // 这里不再额外碰 DashMap。流式起始（begin）走的也是这条槽。
+        // Sync path: the _pending guard clears the registry when handle returns.
+        // begin() lands in this same slot when it runs inside the callback.
         Some(delivery) => delivery,
         None => match rx.await {
             Ok(d) => d,
@@ -397,8 +397,8 @@ pub unsafe extern "C" fn hyper4k_server_start(
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req| handle(req, ctx.clone()));
-                        // auto::Builder 按连接首部 preface 自动识别 h1 / h2c，
-                        // 单端口同时服务两种协议（设计 §3.3）。不做 ALPN：TLS 由前置代理终止。
+                        // auto::Builder sniffs the connection preface, so a single
+                        // port serves h1 and h2c. No ALPN: TLS terminates upstream.
                         let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                             .serve_connection(io, service)
                             .await;
@@ -440,7 +440,7 @@ pub unsafe extern "C" fn hyper4k_respond(
     };
 
     if active_streams().contains_key(&responder) {
-        // 已进入流式：一次性应答与流式三函数互斥。
+        // Already streaming: one-shot and streaming are mutually exclusive.
         return HYPER4K_ERR_WRONG_STATE;
     }
 
@@ -467,13 +467,14 @@ fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
     )
 }
 
-/// 开始一个流式响应：立即发出状态行与响应头，body 随后由 write 分块供给。
+/// Starts a streaming response: status and headers go out now, the body follows
+/// as write() chunks.
 ///
-/// 成功返回 `HYPER4K_OK`。responder 已完成 / 已在流式态 / 已失效时返回
-/// `HYPER4K_ERR_WRONG_STATE`。
+/// Returns `HYPER4K_OK`, or `HYPER4K_ERR_WRONG_STATE` if the responder is already
+/// completed, already streaming, or stale.
 ///
 /// # Safety
-/// headers 缓冲必须在本次调用期间保持有效。
+/// The header buffer must stay valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn hyper4k_response_begin(
     responder: u64,
@@ -488,9 +489,10 @@ pub unsafe extern "C" fn hyper4k_response_begin(
     let headers = parse_headers(headers_ptr, headers_len);
     let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_CAPACITY);
 
-    // 先占状态位再交付：否则另一线程可能在 begin 返回前就 write，
-    // 此时表里还没有条目，会被误判为 WRONG_STATE。
-    // 用 entry 而非 insert：重复 begin 必须被拒绝，不能顶掉在途的流。
+    // Claim the state before delivering: another thread can call write() before
+    // begin() returns, and a missing entry would be misread as WRONG_STATE.
+    // entry() rather than insert(): a repeated begin must be refused, never replace
+    // the sender of a stream already in flight.
     match active_streams().entry(responder) {
         dashmap::mapref::entry::Entry::Occupied(_) => return HYPER4K_ERR_WRONG_STATE,
         dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -514,17 +516,18 @@ pub unsafe extern "C" fn hyper4k_response_begin(
     HYPER4K_OK
 }
 
-/// 写出一个 body 块。数据在本调用内被拷贝，返回后调用方缓冲即可释放。
+/// Writes one body chunk. The data is copied during the call, so the caller may
+/// release its buffer on return.
 ///
-/// 下游写不动时本函数**阻塞**调用线程——这就是背压。因此它只能在可安全阻塞的
-/// 线程上调用；在引擎线程（Tokio worker）上调用会立即返回
-/// `HYPER4K_ERR_WOULD_BLOCK` 而不是拖垮 runtime。
+/// Blocks the calling thread while the downstream is not writable — that is the
+/// backpressure. Call it only where blocking is safe; on an engine thread it
+/// returns `HYPER4K_ERR_WOULD_BLOCK` instead of stalling the runtime.
 ///
-/// 客户端已断开返回 `HYPER4K_ERR_CLIENT_GONE`：停止产生数据并 finish 收尾，
-/// 这不是错误路径。
+/// `HYPER4K_ERR_CLIENT_GONE` means the client is gone: stop producing data and
+/// call finish. That is a normal path, not an error.
 ///
 /// # Safety
-/// chunk 缓冲必须在本次调用期间保持有效。
+/// The chunk buffer must stay valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn hyper4k_response_write(
     responder: u64,
@@ -534,14 +537,14 @@ pub unsafe extern "C" fn hyper4k_response_write(
     if responder == 0 {
         return HYPER4K_ERR_WRONG_STATE;
     }
-    // 克隆发送端并立刻释放 DashMap 守卫：绝不能持着分片锁去阻塞。
+    // Clone the sender and drop the guard: never block while holding a shard lock.
     let sender = match active_streams().get(&responder) {
         Some(entry) => entry.value().clone(),
         None => return HYPER4K_ERR_WRONG_STATE,
     };
 
     if chunk_len == 0 {
-        // 空块没有语义（HTTP/1.1 里 0 长度 chunk 就是流结束），直接忽略。
+        // An empty chunk carries no meaning, and a zero-length HTTP/1.1 chunk ends a stream.
         return HYPER4K_OK;
     }
     if chunk_ptr.is_null() {
@@ -553,11 +556,10 @@ pub unsafe extern "C" fn hyper4k_response_write(
         Ok(()) => HYPER4K_OK,
         Err(mpsc::error::TrySendError::Closed(_)) => HYPER4K_ERR_CLIENT_GONE,
         Err(mpsc::error::TrySendError::Full(chunk)) => {
-            // 通道满 = 客户端读得慢 = 需要阻塞等待容量。
-            // 但若当前线程属于某个 Tokio runtime，阻塞它就是在饿死引擎自己，
-            // 且 blocking_send 会 panic（crate 以 panic=abort 编译，等于进程死）。
-            // 这正是设计 §4.2 要求「流式写入必须切到可阻塞调度器」的原因，
-            // 这里把那个错误变成一个明确的返回码，而不是一次 p99 劣化。
+            // A full channel means the client is behind and we have to wait for room.
+            // Blocking a runtime thread would starve the engine, and blocking_send
+            // panics in async context, which under panic = "abort" kills the process.
+            // Report it instead, so a misplaced write fails loudly rather than slowly.
             if Handle::try_current().is_ok() {
                 return HYPER4K_ERR_WOULD_BLOCK;
             }
@@ -569,15 +571,15 @@ pub unsafe extern "C" fn hyper4k_response_write(
     }
 }
 
-/// 结束流式响应并释放 responder。之后该 responder 失效。
+/// Ends the streaming response and releases the responder.
 ///
-/// 幂等：重复调用返回 `HYPER4K_ERR_WRONG_STATE` 而不是 UB。
+/// Idempotent: a repeated call returns `HYPER4K_ERR_WRONG_STATE`, not UB.
 #[no_mangle]
 pub extern "C" fn hyper4k_response_finish(responder: u64) -> i32 {
     if responder == 0 {
         return HYPER4K_ERR_WRONG_STATE;
     }
-    // 移除条目 -> 最后一个 Sender 被 drop -> body 的 recv 返回 None -> 流正常收尾。
+    // Removing the entry drops the last sender, so the body's recv ends the stream.
     match active_streams().remove(&responder) {
         Some(_) => HYPER4K_OK,
         None => HYPER4K_ERR_WRONG_STATE,
@@ -645,7 +647,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// 从一次交付里取出一次性应答；流式交付在这些用例里是失败。
+    /// Unwraps a one-shot delivery; a stream is a failure in these cases.
     fn buffered(delivery: Delivery) -> ResponseData {
         match delivery {
             Delivery::Buffered(data) => data,
@@ -653,7 +655,7 @@ mod tests {
         }
     }
 
-    /// 分配一个空闲端口。绑定后立刻释放，把端口号交给被测服务器。
+    /// Picks a free port and releases it for the server under test.
     fn free_port() -> u16 {
         let probe = StdTcpListener::bind("127.0.0.1:0").expect("allocate test port");
         let port = probe.local_addr().expect("test address").port();
@@ -764,7 +766,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ABI v3：状态机
+    // ABI v3: state machine
     // -----------------------------------------------------------------------
 
     #[test]
@@ -775,12 +777,12 @@ mod tests {
             unsafe { hyper4k_response_begin(responder, 200, std::ptr::null(), 0) },
             HYPER4K_OK
         );
-        // 已在流式态：一次性应答被拒，且不是 UB。
+        // Already streaming: the one-shot path is refused, and it is not UB.
         assert_eq!(
             unsafe { hyper4k_respond(responder, 500, std::ptr::null(), 0, std::ptr::null(), 0) },
             HYPER4K_ERR_WRONG_STATE
         );
-        // 重复 begin 同样被拒，且不能顶掉在途的流。
+        // A repeated begin is refused and must not replace the stream in flight.
         assert_eq!(
             unsafe { hyper4k_response_begin(responder, 204, std::ptr::null(), 0) },
             HYPER4K_ERR_WRONG_STATE
@@ -792,12 +794,12 @@ mod tests {
         }
 
         assert_eq!(hyper4k_response_finish(responder), HYPER4K_OK);
-        // finish 幂等：第二次是 WRONG_STATE，不是二次释放。
+        // finish is idempotent: the second call is WRONG_STATE, not a double free.
         assert_eq!(
             hyper4k_response_finish(responder),
             HYPER4K_ERR_WRONG_STATE
         );
-        // 收尾后写入安全失败。
+        // Writing after finish fails safely.
         assert_eq!(
             unsafe { hyper4k_response_write(responder, b"x".as_ptr(), 1) },
             HYPER4K_ERR_WRONG_STATE
@@ -825,7 +827,7 @@ mod tests {
             HYPER4K_OK
         );
 
-        // 丢弃 body 接收端 == 连接已断、响应体已被 drop。
+        // Dropping the receiver stands in for a dead connection.
         let start = match receiver.try_recv().expect("stream start") {
             Delivery::Stream(start) => start,
             Delivery::Buffered(_) => panic!("expected a stream start"),
@@ -836,18 +838,18 @@ mod tests {
             unsafe { hyper4k_response_write(responder, b"late".as_ptr(), 4) },
             HYPER4K_ERR_CLIENT_GONE
         );
-        // 客户端走了仍需 finish 收尾，responder 才不会泄漏。
+        // finish is still required once the client is gone, or the responder leaks.
         assert_eq!(hyper4k_response_finish(responder), HYPER4K_OK);
         assert!(!active_streams().contains_key(&responder));
         drop(registration);
     }
 
     // -----------------------------------------------------------------------
-    // ABI v3：端到端流式（验收 §六.2）
+    // ABI v3: end-to-end streaming
     // -----------------------------------------------------------------------
 
-    /// handler 线程与测试线程之间的闸门：
-    /// `first_sent` —— 第一个事件已写出；`release` —— 允许写最后一个事件。
+    /// Gate between the handler thread and the test thread: `first_sent` reports
+    /// that event one is out, `release` allows the last event to be written.
     struct SseGate {
         first_sent: std_mpsc::Sender<()>,
         release: Mutex<std_mpsc::Receiver<()>>,
@@ -856,7 +858,7 @@ mod tests {
 
     extern "C" fn sse_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
         let responder = unsafe { (*request).responder };
-        // 写入必须离开引擎线程：hyper4k_response_write 会阻塞（设计 §4.2）。
+        // Writes must leave the engine thread: hyper4k_response_write blocks.
         thread::spawn(move || {
             let headers = b"Content-Type: text/event-stream\nCache-Control: no-cache\n";
             assert_eq!(
@@ -874,7 +876,7 @@ mod tests {
             );
             gate.first_sent.send(()).expect("signal first event");
 
-            // 在测试线程确认「已收到第 1 个事件」之前，最后一个事件不会被发出。
+            // The last event is not written until the test confirms it read the first.
             gate.release
                 .lock()
                 .expect("gate lock")
@@ -915,7 +917,7 @@ mod tests {
             .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .expect("write request");
 
-        // 读到第 1 个事件为止——此时响应显然还没结束。
+        // Read until the first event arrives; the response is still open at that point.
         let mut seen = Vec::new();
         let mut buf = [0u8; 1024];
         while !String::from_utf8_lossy(&seen).contains("data: event-1") {
@@ -926,8 +928,9 @@ mod tests {
 
         let head = String::from_utf8_lossy(&seen).to_string();
         assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
-        // 真流式的判据：客户端拿到第 1 个事件时，服务端尚未发出最后一个事件。
-        // handler 此刻正阻塞在 release 闸门上，所以这不是时序巧合。
+        // The test for real streaming: the client holds event one while the server
+        // has not sent the last one. The handler is parked on the gate, so this holds
+        // structurally rather than by timing.
         assert!(
             !head.contains("data: event-2"),
             "response was buffered, not streamed: {head}"
@@ -945,7 +948,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ABI v3：h2c（验收 §六.4）
+    // ABI v3: h2c
     // -----------------------------------------------------------------------
 
     #[test]
@@ -960,7 +963,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
-        // h2 连接前言 + 一个空 SETTINGS 帧，等价于 curl --http2-prior-knowledge 的开场。
+        // h2 preface plus an empty SETTINGS frame: what --http2-prior-knowledge sends.
         stream
             .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
             .expect("write preface");
@@ -972,7 +975,7 @@ mod tests {
         stream
             .read_exact(&mut frame_header)
             .expect("server must answer the h2 preface");
-        // 服务端的第一帧必须是 SETTINGS(0x04)；走 h1 解析的话这里会是 "HTTP/1.1 400"。
+        // The first frame must be SETTINGS(0x04); an h1 parse would answer "HTTP/1.1 400".
         assert_eq!(
             frame_header[3], 0x04,
             "expected a SETTINGS frame, got {frame_header:?}"

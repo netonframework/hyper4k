@@ -154,7 +154,7 @@ class Hyper4kServerTest {
         dispatcher.submit(request(), 1uL)
         withTimeout(1_000) { finished.await() }
 
-        // 流式响应不能再被一次性写出一遍——那会是「头发两次」。
+        // A streamed response must not be written out again, that sends headers twice.
         assertEquals(0, oneShotWrites)
         assertEquals(200, channel.status)
         assertEquals(listOf("data: 1\n\n", "data: 2\n\n"), channel.chunks)
@@ -184,14 +184,14 @@ class Hyper4kServerTest {
         dispatcher.stopAccepting()
         dispatcher.awaitDrained(1_000)
 
-        // 头早就发出去了，5xx 兜底响应写不回去；唯一正确的动作是收尾，而不是
-        // 在已经开始的流上再写一个完整响应。
+        // The headers are already out, so the 5xx fallback cannot be written.
+        // Closing the stream is the only correct move.
         assertEquals(0, oneShotWrites)
         assertTrue(channel.isFinished)
         dispatcher.cancelAndJoin()
     }
 
-    /** 记录调用的假通道，用来在没有真实 responder 的情况下测调度逻辑。 */
+    /** Fake channel that records calls, so dispatch logic is testable without a responder. */
     private class RecordingChannel : Hyper4kResponseChannel {
         var status: Int? = null
         val chunks = mutableListOf<String>()

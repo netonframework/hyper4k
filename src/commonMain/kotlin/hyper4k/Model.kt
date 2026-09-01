@@ -49,8 +49,8 @@ class Hyper4kRequest(
 /**
  * 一次响应。[headers] 会被编码回 "Name: Value\n" 文本块。
  *
- * [streamed] 为 true 表示响应体已经由 [Hyper4kResponseChannel] 直接写给引擎了，
- * 引擎不再写出这个对象——它只是一个「我已经自己应答完了」的回执。
+ * [streamed] is true when the body already went to the engine through a
+ * [Hyper4kResponseChannel]; the engine will not write this object out again.
  */
 class Hyper4kResponse(
     val status: Int,
@@ -61,7 +61,7 @@ class Hyper4kResponse(
     companion object {
         private val EMPTY = ByteArray(0)
 
-        /** handler 走完流式路径后的回执，见 [Hyper4kResponseChannel]。 */
+        /** Receipt for a handler that answered through a [Hyper4kResponseChannel]. */
         fun streamed(status: Int = 200) = Hyper4kResponse(status, streamed = true)
 
         fun text(status: Int = 200, body: String, contentType: String = "text/plain; charset=utf-8") =
@@ -76,35 +76,38 @@ class Hyper4kResponse(
 }
 
 /**
- * 流式响应的下行通道：先发头，再分块发体，最后收尾（ABI v3）。
+ * Downstream channel for a streaming response: headers first, then body chunks,
+ * then close (ABI v3).
  *
- * 与「返回一个 [Hyper4kResponse]」互斥：一旦调用了 [begin]，handler 必须自己
- * 用 [finish] 收尾，并返回 [Hyper4kResponse.streamed] 作为回执。
+ * Mutually exclusive with returning a [Hyper4kResponse]: once [begin] is called
+ * the handler closes the stream itself with [finish] and returns
+ * [Hyper4kResponse.streamed] as its receipt.
  *
- * [write] 带背压——客户端读得慢时它会等。实现保证这个等待不会发生在引擎线程上。
+ * [write] carries backpressure and waits while the client reads slowly.
+ * Implementations keep that wait off the engine threads.
  */
 interface Hyper4kResponseChannel {
-    /** 是否已经进入流式（调用过 [begin]）。 */
+    /** Whether the response has entered streaming, that is [begin] was called. */
     val isStreaming: Boolean
 
-    /** 已写出的 body 字节数。 */
+    /** Body bytes written so far. */
     val bytesWritten: Long
 
     /**
-     * 立即发出状态行与响应头，body 随后由 [write] 供给。
+     * Sends the status line and headers now; the body follows through [write].
      *
-     * 不要自己设置 Content-Length：长度由引擎按协议表达
-     * （HTTP/1.1 chunked 或 HTTP/2 DATA 帧）。
+     * Do not set Content-Length: the engine expresses the length per protocol,
+     * as HTTP/1.1 chunked or HTTP/2 DATA frames.
      */
     suspend fun begin(status: Int, headers: Map<String, List<String>> = emptyMap())
 
     /**
-     * 写出一块 body。返回 false 表示**客户端已断开**：停止产生数据并 [finish] 收尾。
-     * 这是正常路径（SSE 客户端关页面就走这里），不是错误。
+     * Writes one body chunk. false means the client is gone: stop producing data
+     * and close with [finish]. That is a normal path, not an error.
      */
     suspend fun write(chunk: ByteArray): Boolean
 
-    /** 收尾并释放。幂等：重复调用无副作用。 */
+    /** Closes and releases the response. Idempotent. */
     suspend fun finish()
 }
 
@@ -112,10 +115,11 @@ interface Hyper4kResponseChannel {
 typealias Hyper4kHandler = suspend (Hyper4kRequest) -> Hyper4kResponse
 
 /**
- * 可流式的请求处理器。
+ * A request handler that may stream its response body.
  *
- * 两种收尾方式二选一：返回一个普通 [Hyper4kResponse]（引擎负责写出），
- * 或者用 [channel] 自己流式写出、然后返回 [Hyper4kResponse.streamed]。
+ * Two ways to finish, pick one: return an ordinary [Hyper4kResponse] and let the
+ * engine write it, or stream through [channel] and return
+ * [Hyper4kResponse.streamed].
  */
 typealias Hyper4kStreamingHandler =
     suspend (request: Hyper4kRequest, channel: Hyper4kResponseChannel) -> Hyper4kResponse

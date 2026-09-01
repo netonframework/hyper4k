@@ -209,8 +209,9 @@ internal class AsyncRequestDispatcher(
         channel: Hyper4kResponseChannel?,
     ) {
         try {
-            // 已经进入流式的请求，头早就发出去了——此时无论 handler 返回什么
-            // （包括超时/异常兜底的 5xx）都写不回去，唯一正确的动作是收尾。
+            // Once a request is streaming its headers are already out, so nothing
+            // the handler returns can be written, not even the 5xx fallbacks.
+            // Closing the stream is the only correct move.
             if (channel != null && channel.isStreaming) {
                 runCatching { channel.finish() }
             } else if (!response.streamed) {
@@ -279,39 +280,42 @@ private fun respond(responder: ULong, response: Hyper4kResponse): Boolean {
 private fun defaultFailureResponse(status: Int, message: String) = Hyper4kResponse.text(status, message)
 
 // ---------------------------------------------------------------------------
-// 流式下行通道（ABI v3）
+// Streaming downstream channel (ABI v3)
 // ---------------------------------------------------------------------------
 
 /**
- * 流式写出专用线程池。
+ * Dedicated pool for streaming writes.
  *
- * 为什么不用 [Dispatchers.Default]：那是所有 Kotlin 协程共用的池，按 CPU 数量定大小；
- * `hyper4k_response_write` 靠阻塞线程表达背压，几个慢客户端就能把它占满，
- * 于是「慢客户端拖垮所有请求」——正是 §4.2 要避的那类问题换了个位置发生。
- * （Kotlin/Native 上 `Dispatchers.IO` 目前还是 internal，用不了。）
+ * Not [Dispatchers.Default]: that pool is shared by every coroutine and sized to
+ * the CPU count. `hyper4k_response_write` expresses backpressure by blocking its
+ * thread, so a handful of slow clients would fill it and stall unrelated
+ * requests. (`Dispatchers.IO` is still internal on Kotlin/Native.)
  *
- * 池大小按「同时**卡住**的流」而不是「同时活着的流」估：通道有容量，
- * 客户端跟得上时 write 立刻返回，根本不占线程；只有慢客户端才会真的占着一个。
+ * Size it by the streams that are stuck at once, not the streams that are alive:
+ * the channel has capacity, so a write returns immediately while the client
+ * keeps up and holds no thread at all.
  */
 @OptIn(DelicateCoroutinesApi::class)
 private val streamWriteDispatcher by lazy { newFixedThreadPoolContext(32, "hyper4k-stream") }
 
-/** ABI v3 返回码，与 lib/include/hyper4k.h 保持一致。 */
+/** ABI v3 return codes, kept in step with lib/include/hyper4k.h. */
 private const val ABI_OK = 1
 private const val ABI_ERR_WRONG_STATE = -4
 private const val ABI_ERR_CLIENT_GONE = -5
 private const val ABI_ERR_WOULD_BLOCK = -6
 
 /**
- * 把 [Hyper4kResponseChannel] 映射到 ABI v3 的 begin / write / finish。
+ * Maps [Hyper4kResponseChannel] onto the ABI v3 begin / write / finish calls.
  *
- * **写入一律先切到 [streamWriteDispatcher]**：`hyper4k_response_write` 靠阻塞调用线程
- * 表达背压，而 handler 是以 UNDISPATCHED 启动的——不挂起的 handler 直接在
- * Tokio worker 上内联执行。在那儿阻塞就是拿引擎自己的线程去等慢客户端，
- * 会把「阻塞引擎 worker」的老问题以更隐蔽的形式带回来（设计 §4.2）。
+ * Every write hops to [streamWriteDispatcher] first. `hyper4k_response_write`
+ * expresses backpressure by blocking its caller, and handlers start UNDISPATCHED,
+ * so a handler that never suspends runs inline on a Tokio worker. Blocking there
+ * spends an engine thread waiting on a slow client, which is the old
+ * "blocked engine worker" problem in a quieter form.
  *
- * 引擎侧对此还有一道兜底：真在引擎线程上要阻塞时它返回 HYPER4K_ERR_WOULD_BLOCK
- * 而不是阻塞。收到那个码说明这里的切换失效了，所以直接抛出而不是静默重试。
+ * The engine backs this up: asked to block on an engine thread it returns
+ * HYPER4K_ERR_WOULD_BLOCK instead. That code means the hop above failed, so it
+ * is thrown rather than retried silently.
  */
 @OptIn(ExperimentalForeignApi::class)
 internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResponseChannel {
@@ -325,8 +329,8 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
     override suspend fun begin(status: Int, headers: Map<String, List<String>>) {
         check(!started) { "hyper4k: response already begun" }
         val headerBytes = encodeHeaders(headers)
-        // begin 不阻塞（只是把「流的开端」交给连接协程），因此不必换线程；
-        // 留在引擎线程上还能命中 ABI v2 的同步快路径。
+        // begin does not block, it only hands the head of the stream to the
+        // connection task, so it stays put and can still hit the v2 sync fast path.
         val rc = headerBytes.usePinned { pinned ->
             hyper4k_response_begin(
                 responder = responder,
@@ -358,7 +362,7 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
                 written += chunk.size
                 true
             }
-            // 客户端关了页面：停止产数据并收尾，这不是错误。
+            // The client closed its tab: stop producing data and close. Not an error.
             ABI_ERR_CLIENT_GONE -> false
             ABI_ERR_WOULD_BLOCK -> error(
                 "hyper4k_response_write would block on an engine thread; " +

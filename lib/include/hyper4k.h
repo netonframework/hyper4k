@@ -75,52 +75,57 @@ int32_t hyper4k_respond(Hyper4kResponder responder,
                        const uint8_t *body_ptr, size_t body_len);
 
 /* -------------------------------------------------------------------------
- * ABI v3：流式响应
+ * ABI v3: streaming responses
  *
- * 下面三个函数与 hyper4k_respond 互斥：一个 responder 要么走一次性应答，
- * 要么走流式，不能混用（混用返回 HYPER4K_ERR_WRONG_STATE，不是 UB）。
+ * These three calls are mutually exclusive with hyper4k_respond: a responder
+ * either answers once or streams. Mixing them returns HYPER4K_ERR_WRONG_STATE
+ * rather than invoking undefined behaviour.
  * ------------------------------------------------------------------------- */
 
-#define HYPER4K_OK                 (1)   /* 操作成功                                     */
-#define HYPER4K_FAILED             (0)   /* responder 已失效或已完成（v2 语义）          */
-#define HYPER4K_ERR_WRONG_STATE   (-4)   /* responder 状态不允许该操作                   */
-#define HYPER4K_ERR_CLIENT_GONE   (-5)   /* 客户端已断开，停止写入并 finish              */
-#define HYPER4K_ERR_WOULD_BLOCK   (-6)   /* 需要阻塞，但调用线程是引擎线程（见 write）   */
+#define HYPER4K_OK                 (1)   /* success                                       */
+#define HYPER4K_FAILED             (0)   /* responder is stale or already completed        */
+#define HYPER4K_ERR_WRONG_STATE   (-4)   /* the responder's state forbids this call        */
+#define HYPER4K_ERR_CLIENT_GONE   (-5)   /* client is gone; stop writing and call finish   */
+#define HYPER4K_ERR_WOULD_BLOCK   (-6)   /* would block on an engine thread; see write     */
 
 /*
- * 开始一个流式响应：立即发出状态行与响应头，body 随后分块写出。
+ * Starts a streaming response: the status line and headers go out immediately,
+ * the body follows as chunks.
  *
- * 调用后 responder 进入流式状态，hyper4k_respond 对它失效。必须以
- * hyper4k_response_finish 收尾。
+ * The responder enters the streaming state and hyper4k_respond no longer applies
+ * to it. It must be closed with hyper4k_response_finish.
  *
- * headers 编码同 v2：每行 "Name: Value\n"。
- * 不要自己设置 Content-Length —— 流式响应由引擎按协议选择
- * chunked(HTTP/1.1) 或 DATA 帧(HTTP/2)。
+ * Headers use the v2 encoding: one "Name: Value\n" per line.
+ * Do not set Content-Length yourself: the engine frames a streaming body as
+ * chunked (HTTP/1.1) or DATA frames (HTTP/2).
  */
 int32_t hyper4k_response_begin(Hyper4kResponder responder,
                               uint16_t status,
                               const uint8_t *headers_ptr, size_t headers_len);
 
 /*
- * 写出一个 body 块。数据在本调用内被拷贝，返回后你的缓冲即可释放。
+ * Writes one body chunk. The data is copied during the call, so your buffer can
+ * be released on return.
  *
- * 背压：客户端读得慢时本函数会阻塞调用线程直到下游可写。因此它 MUST 在能安全
- * 阻塞的线程上调用。若在引擎线程（Tokio worker）上调用且此刻需要阻塞，本函数
- * 不会阻塞，而是立即返回 HYPER4K_ERR_WOULD_BLOCK —— 收到这个码说明调用方把
- * 流式写入留在了引擎线程上，应切到可阻塞的调度器。
+ * Backpressure: while the client reads slowly this call blocks the calling
+ * thread until the downstream is writable, so it must run on a thread where
+ * blocking is safe. Called on an engine thread (a Tokio worker) it returns
+ * HYPER4K_ERR_WOULD_BLOCK instead of blocking; that code means streaming writes
+ * were left on the engine thread and belong on a blocking-capable dispatcher.
  *
- * 返回 HYPER4K_ERR_CLIENT_GONE 表示客户端已断开：停止产生数据并调用 finish
- * 收尾，这不是错误路径，SSE 客户端关页面就是这个码。
+ * HYPER4K_ERR_CLIENT_GONE means the client disconnected: stop producing data and
+ * call finish. It is a normal path, and it is what an SSE client closing its tab
+ * looks like.
  */
 int32_t hyper4k_response_write(Hyper4kResponder responder,
                               const uint8_t *chunk_ptr, size_t chunk_len);
 
 /*
- * 结束流式响应并释放 responder。之后该 responder 失效。
- * 幂等：重复调用返回 HYPER4K_ERR_WRONG_STATE 而不是 UB。
+ * Ends the streaming response and releases the responder.
+ * Idempotent: a repeated call returns HYPER4K_ERR_WRONG_STATE, not UB.
  *
- * 即使 write 已经返回 HYPER4K_ERR_CLIENT_GONE，也仍要调用一次 finish，
- * 否则该 responder 的条目不会被回收。
+ * finish is required even after write returned HYPER4K_ERR_CLIENT_GONE,
+ * otherwise the responder's entry is never reclaimed.
  */
 int32_t hyper4k_response_finish(Hyper4kResponder responder);
 
