@@ -75,10 +75,12 @@ kotlin {
 rustTriples.forEach { (ktTarget, triple) ->
     tasks.register<Exec>("cargoBuild${ktTarget.replaceFirstChar { it.uppercase() }}") {
         group = "hyper4k"
-        description = "cargo build --release --target $triple"
+        description = "cargo rustc --release --target $triple --crate-type staticlib"
         workingDir = crateDir
-        // 跨平台交叉编译建议用 cargo-zigbuild：
-        //   commandLine("cargo", "zigbuild", "--release", "--target", triple)
-        commandLine("cargo", "build", "--release", "--target", triple)
+        // 只建 staticlib。Kotlin/Native 链接的是 libhyper4k.a，而 Cargo.toml 里另一个
+        // crate-type（cdylib）只服务本地开发/JVM。交叉编译时 .a 是纯归档、不经 linker，
+        // 而 .so 要用目标平台的 linker——在 macOS 上 `cargo build` 会因为 ld 不认
+        // --version-script 之类的 GNU 选项而失败，卡住的是我们根本不用的那个产物。
+        commandLine("cargo", "rustc", "--release", "--target", triple, "--crate-type", "staticlib")
     }
 }
