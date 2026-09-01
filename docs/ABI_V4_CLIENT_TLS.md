@@ -84,28 +84,51 @@ typedef struct { Hyper4kSlice name; Hyper4kSlice value; } Hyper4kHeader;
 /* ABI 版本：(major << 16) | minor。major 变化即不兼容。 */
 #define HYPER4K_ABI_VERSION  ((4u << 16) | 0u)
 
-/* client capability bits —— 只列已实现且有测试的。 */
-#define HYPER4K_CLIENT_CAP_TLS           (1ull << 0)
+/* client capability bits —— 只列 v4 已实现且有测试的。 */
+#define HYPER4K_CLIENT_CAP_HTTP1         (1ull << 0)
 #define HYPER4K_CLIENT_CAP_HTTP2         (1ull << 1)
-#define HYPER4K_CLIENT_CAP_CUSTOM_CA     (1ull << 2)
-#define HYPER4K_CLIENT_CAP_CANCEL        (1ull << 3)
+#define HYPER4K_CLIENT_CAP_TLS           (1ull << 2)
+#define HYPER4K_CLIENT_CAP_CUSTOM_CA     (1ull << 3)
+#define HYPER4K_CLIENT_CAP_CANCEL        (1ull << 4)
+#define HYPER4K_CLIENT_CAP_STREAMING     (1ull << 5)  /* 响应体分块 + 背压 */
+/* v4 不提供 h2c prior knowledge（明文 HTTP/2），故无对应位。 */
 
 /* client flags */
 #define HYPER4K_CLIENT_HTTP2_REQUIRED    (1ull << 0)
 #define HYPER4K_CLIENT_CA_REPLACE_SYSTEM (1ull << 1)  /* 缺省是"追加" */
 ```
 
-`custom_ca_pem` **默认追加到系统根证书之上**；置 `CA_REPLACE_SYSTEM` 才替换。
-两种语义差别很大（私有 CA 场景要追加，固定 pinning 场景要替换），不能靠猜。
+`CA_REPLACE_SYSTEM` **替换的是信任根集合**，不是 certificate pinning —— pinning
+锁定的是具体证书或公钥，是另一回事，本版不提供。
+
+### 2.2 Options
+
+```c
+typedef struct {
+    uint32_t       abi_version;
+    uint32_t       struct_size;
+    uint64_t       flags;
+    uint64_t       connect_timeout_ms;
+    uint64_t       request_timeout_ms;       /* 0 = 不限总时长 */
+    uint64_t       read_idle_timeout_ms;     /* 每请求的缺省块间空闲上限 */
+    uint32_t       max_retries;              /* 额外重试次数，0 = 不重试 */
+    uint32_t       _reserved;
+    const uint8_t *custom_ca_pem;            /* NULL = 只用系统根证书 */
+    size_t         custom_ca_pem_len;
+} Hyper4kClientOptions;
+```
+
+`request_timeout_ms = 0` 表示**禁用**总超时。SSE 这类长流必须能禁用它，此时由
+`read_idle_timeout_ms` 兜底。两者都为 0 是合法配置（永久流），由调用方自己负责。
+
+`max_retries` 是**额外**重试次数：`0` = 只尝试一次，`2` = 最多三次尝试。缺省 2。
 
 `hyper4k_client_new()` 在调用内**复制 options 指向的全部数据**，返回后调用方的
-缓冲即可释放。兼容规则：`struct_size` 小于本版本已知大小时，缺失字段取默认值；
+缓冲即可释放。兼容规则：`struct_size` 小于本版本已知大小时缺失字段取默认值；
 大于时忽略尾部多余字节；**`flags` 里出现未知位一律拒绝**（静默忽略未知开关会让
 安全相关的 flag 失效而无人察觉）。
 
-### 2.2 生命周期：close 与 free 分离
-
-单一 `free` 无法同时满足"不阻塞"和"不 use-after-free"。拆成两步：
+### 2.3 生命周期与线程模型
 
 ```c
 Hyper4kClient *hyper4k_client_new(const Hyper4kClientOptions *opts,
@@ -113,34 +136,94 @@ Hyper4kClient *hyper4k_client_new(const Hyper4kClientOptions *opts,
 
 /* 幂等、非阻塞。停止接收新请求，取消在途请求。
    每个已接受的请求仍会收到恰好一次 OnDone。 */
-void    hyper4k_client_close(Hyper4kClient *client);
+void hyper4k_client_close(Hyper4kClient *client);
 
-/* 阻塞直到所有请求到达终态且不再产生任何回调，然后释放。
-   MUST NOT 从回调线程调用 —— 那会自己等自己，必然死锁。
-   调用方保证：free 返回后 user_data 才可以被回收。 */
-void    hyper4k_client_free(Hyper4kClient *client);
+/* 阻塞直到所有请求到达终态且不再产生任何回调，然后释放。 */
+void hyper4k_client_free(Hyper4kClient *client);
 ```
 
-Kotlin 侧的 `close()` 映射为 `close` + `free`，在非回调线程上执行。
+冻结的线程契约：
 
-### 2.3 回调线程与背压
+- `send` / `cancel` / `resume` / `close` 可从**任意非回调线程并发**调用。
+- `free` 需要**独占所有权**，不得与其他 API 并发；**MUST NOT 从回调线程调用**
+  （会自己等自己，必然死锁）。
+- `free(NULL)` 与重复 `free` **不承诺安全**。Kotlin wrapper 负责保证只调用一次。
+- 每个请求的 `user_data` 在**该请求的 `OnDone` 返回后**即可释放 —— 它是每请求
+  传入的，不必等到整个 client 释放。
+- 回调必须快速返回、不得阻塞、**不得调用 `free`**。
 
-回调**不在 Tokio I/O worker 上执行**。Rust 内部为每个 client 维护一个专用的
-bridge executor 与**有界**队列；I/O worker 只把事件投递进队列。
+### 2.4 错误描述符
 
-- 队列满时，Rust 侧对该 stream **施加 HTTP/2 流控背压**（停止读取窗口），
-  而不是无界缓存，也不是丢数据，更不是阻塞 I/O worker。
-- 慢消费者只拖慢自己那条 stream，不影响同连接的其他 stream。
+`OnDone` 只给一个整数无法运维 —— "为什么连不上"和"证书哪里不对"是两个问题。
+定义在回调之前，回调签名才能引用它。
 
-顺序与并发保证：
+```c
+typedef enum {
+    HYPER4K_ERR_NONE = 0,
+    HYPER4K_ERR_DNS,              HYPER4K_ERR_CONNECT,
+    HYPER4K_ERR_TLS_CA,           HYPER4K_ERR_TLS_HOSTNAME,
+    HYPER4K_ERR_TLS_EXPIRED,      HYPER4K_ERR_TLS_OTHER,
+    HYPER4K_ERR_ALPN_NO_H2,       HYPER4K_ERR_PROTOCOL,
+    HYPER4K_ERR_TIMEOUT,          HYPER4K_ERR_IDLE_TIMEOUT,
+    HYPER4K_ERR_CANCELLED,        HYPER4K_ERR_CLIENT_CLOSED,
+    HYPER4K_ERR_BAD_REQUEST,      /* URL / header 非法，提交期失败 */
+    HYPER4K_ERR_TRUNCATED,        /* 响应已开始但未完整收到，见 §四 */
+    HYPER4K_ERR_OUTCOME_UNKNOWN,  /* 见 §四，重试判定的唯一依据 */
+} Hyper4kErrorKind;
 
-- 同一 `request_id`：`OnHeaders` → `OnChunk`\* → `OnDone`，**严格串行**。
-- 不同 `request_id`：回调**可以并发**，Kotlin 侧回调实现必须是线程安全的。
-- `OnDone` 对每个**已被接受**的请求**恰好一次**；其后不再有该 id 的任何回调。
-- 回调**不得让异常跨越 C ABI**。Kotlin wrapper 必须在边界捕获，转成对该请求的
-  取消 —— 异常穿过 FFI 是未定义行为，而 crate 是 `panic = "abort"`。
+typedef struct {
+    int32_t      kind;          /* Hyper4kErrorKind，稳定分类 */
+    uint32_t     protocol_code; /* 如 HTTP/2 错误码；无则 0 */
+    Hyper4kSlice message;       /* 借用的诊断文本，仅供日志，不得用于分支判断 */
+} Hyper4kError;
+```
 
-### 2.4 发起与取消
+**HTTP 4xx/5xx 是正常响应,不是错误**：走 `OnHeaders` + `OnDone(NULL)`。只有传输
+层与协议层失败才进 error。把 404 当异常会逼调用方用错误码做业务分支。
+
+**Trailers 本版不支持**，收到即忽略；需要时作为独立 ABI 项另加。
+
+### 2.5 回调
+
+三种回调集中定义在 `send` 之前，`send` 才能引用它们。
+
+```c
+/* 借用期：所有切片仅在回调体内有效，返回后即失效；需要留存必须复制。
+   线程：同一 request_id 严格串行；不同 request_id 可并发，
+        Kotlin 侧回调实现必须线程安全。
+   异常：不得跨越 C ABI —— crate 是 panic = "abort"，穿过去就是 UB。
+        Kotlin wrapper 必须在边界捕获，转成对该请求的取消。 */
+
+typedef void (*Hyper4kOnHeaders)(void *ud, uint64_t request_id, uint16_t status,
+                                 const Hyper4kHeader *headers, size_t header_count);
+
+typedef enum {
+    HYPER4K_CHUNK_CONTINUE = 0,  /* 继续投递 */
+    HYPER4K_CHUNK_PAUSE    = 1,  /* 暂停：Rust 停止 poll 该 body */
+    HYPER4K_CHUNK_CANCEL   = 2,  /* 放弃该请求 */
+} Hyper4kChunkAction;
+
+typedef Hyper4kChunkAction (*Hyper4kOnChunk)(void *ud, uint64_t request_id,
+                                             const uint8_t *ptr, size_t len);
+
+typedef void (*Hyper4kOnDone)(void *ud, uint64_t request_id,
+                              const Hyper4kError *error);  /* NULL = 成功 */
+
+/* 恢复被 PAUSE 的响应体。幂等；未暂停或已完成时安全返回。 */
+int32_t hyper4k_client_resume(Hyper4kClient *client, uint64_t request_id);
+```
+
+**背压靠 `OnChunk` 的返回值,不靠队列容量。** `void` 返回的回调无法把"消费不过来"
+这件事告诉 Rust —— 阻塞它会占住 bridge worker，立即返回又会让 Rust 继续读、在
+Kotlin 侧堆出无界缓存。返回 `PAUSE` 后 Rust 停止 poll 该 response body，HTTP/2
+流控窗口自然收敛到对端；Kotlin 腾出空间后调用 `resume`。
+
+**每个 request 一条独立的有界队列**，不是每个 client 一条。共用一条队列时慢
+stream 会堵住同连接的其他 stream，那样"stream 隔离"只是句空话。
+
+`OnDone` 对每个**已被接受**的请求**恰好一次**；其后不再有该 id 的任何回调。
+
+### 2.6 发起与取消
 
 ```c
 typedef struct {
@@ -173,39 +256,17 @@ int32_t hyper4k_client_cancel(Hyper4kClient *client, uint64_t request_id);
 用返回值表达提交失败的具体原因（URL 非法、header 非法、client 已关闭……），
 比"返回 0"能给运维的信息多得多。
 
-**超时分两级**：`request_timeout_ms` 是整个请求的上限，`read_idle_timeout_ms`
-是**块间空闲**上限。SSE 这类长流响应不适用总时长上限，必须靠空闲超时兜底。
+**URL scheme 与 `HTTP2_REQUIRED` 的组合**：
 
-### 2.5 错误描述符
+| scheme | `HTTP2_REQUIRED` | 行为 |
+|---|---|---|
+| `https://` | 否 | ALPN 通告 `h2` + `http/1.1`，按协商结果 |
+| `https://` | 是 | ALPN 未得到 `h2` 即失败，不降级 |
+| `http://` | 否 | HTTP/1.1 |
+| `http://` | 是 | **提交即失败**（v4 不提供 h2c prior knowledge） |
 
-`OnDone` 只给一个整数无法运维 —— "为什么连不上"和"证书哪里不对"是两个问题。
-
-```c
-typedef enum {
-    HYPER4K_ERR_NONE = 0,
-    HYPER4K_ERR_DNS,              HYPER4K_ERR_CONNECT,
-    HYPER4K_ERR_TLS_CA,           HYPER4K_ERR_TLS_HOSTNAME,
-    HYPER4K_ERR_TLS_EXPIRED,      HYPER4K_ERR_TLS_OTHER,
-    HYPER4K_ERR_ALPN_NO_H2,       HYPER4K_ERR_PROTOCOL,
-    HYPER4K_ERR_TIMEOUT,          HYPER4K_ERR_IDLE_TIMEOUT,
-    HYPER4K_ERR_CANCELLED,        HYPER4K_ERR_CLIENT_CLOSED,
-    HYPER4K_ERR_OUTCOME_UNKNOWN,  /* 见 §四，重试判定的唯一依据 */
-} Hyper4kErrorKind;
-
-typedef struct {
-    int32_t      kind;        /* Hyper4kErrorKind，稳定分类 */
-    uint32_t     protocol_code; /* 如 HTTP/2 错误码；无则 0 */
-    Hyper4kSlice message;     /* 借用的诊断文本，仅供日志，不得用于分支判断 */
-} Hyper4kError;
-
-typedef void (*Hyper4kOnDone)(void *ud, uint64_t request_id,
-                              const Hyper4kError *error);  /* NULL = 成功 */
-```
-
-**HTTP 4xx/5xx 是正常响应,不是错误**：走 `OnHeaders` + `OnDone(NULL)`。只有传输
-层与协议层失败才进 error。把 404 当异常会逼调用方用错误码做业务分支。
-
-**Trailers 本版不支持**，收到即忽略；需要时作为独立 ABI 项另加。
+**超时分两级**：`request_timeout_ms` 是整个请求（含全部重试）的上限，**不因重试
+而重置**；`read_idle_timeout_ms` 是块间空闲上限，**每收到一个 body chunk 就重置**。
 
 ## 三、TLS
 
@@ -246,8 +307,24 @@ typedef void (*Hyper4kOnDone)(void *ud, uint64_t request_id,
 **没有 GOAWAY 的连接中断走同一张表。** 传输层无法证明请求未被处理时，语义就是
 "结果未知"，与是否先收到 GOAWAY 无关。
 
-**自动重试必须有次数上限**（缺省 2 次）。连续 `REFUSED_STREAM` 或反复 GOAWAY 的
-服务端会让无上限的重试变成活锁，把一次故障放大成持续压测。
+**自动重试只允许发生在尚未产生任何响应回调之前。** 一旦 `OnHeaders` 或任何
+`OnChunk` 已经发出，响应就对 Kotlin 可见了；此时再重放请求会让调用方收到两份
+headers 或重复的 body 片段 —— 那不是重试，是数据损坏。这条**优先于上面两张表**：
+
+| 已发出响应回调？ | 连接中断时的处理 |
+|---|---|
+| 否 | 按上面两张表判定：可重试则透明重试，否则 `OUTCOME_UNKNOWN` |
+| 是 | **一律不重试**，返回 `HYPER4K_ERR_TRUNCATED` |
+
+`TRUNCATED` 与 `OUTCOME_UNKNOWN` 是两件事：前者请求确定已被处理、只是响应没收完；
+后者连是否被处理都不知道。调用方对这两种情况的决策完全不同。
+
+**自动重试次数上限**由 `Hyper4kClientOptions.max_retries` 给出（额外次数，缺省
+2，即最多三次尝试）。连续 `REFUSED_STREAM` 或反复 GOAWAY 的服务端会让无上限的
+重试变成活锁，把一次故障放大成持续压测。
+
+`request_timeout_ms` **覆盖全部重试**，不因每次重试而重置 —— 否则"总超时"就不是
+上限，一个反复失败的请求能挂到 `max_retries × timeout`。
 
 APNs 的 POST 同样适用。只有传输层能证明请求未被处理时才自动重试；其余情况交给
 上层按 `apns-id` 与业务策略决定。为了"可靠推送"而盲目重试会制造重复通知。
@@ -312,7 +389,17 @@ Rust 侧自动化测试，全部用本地生成的 CA 与证书：
 13. `cancel` 三态正确，且取消胜出后仍收到一次 `OnDone(CANCELLED)`
 14. `custom_ca_pem` 追加与替换两种模式行为符合定义
 15. 未知 `flags` 位被拒绝；`struct_size` 大于/小于当前版本的兼容规则生效
-16. 四个平台编译通过；macOS 与 Linux 做真实运行测试
+16. 背压闭环：`OnChunk` 返回 `PAUSE` 后 Rust 停止 poll 该 body，对端 HTTP/2 流控
+    窗口收敛；`resume` 后继续。慢 stream 不影响同连接其他 stream
+17. `OnChunk` 返回 `CANCEL` 等价于取消，仍收到一次 `OnDone(CANCELLED)`
+18. 响应已可见后连接中断：**不重放**，返回 `TRUNCATED`（与 `OUTCOME_UNKNOWN`
+    可区分）
+19. `request_timeout_ms` 覆盖全部重试、不随重试重置；`read_idle_timeout_ms` 每收
+    到一个 chunk 重置；两者为 0 时的语义符合定义
+20. `http://` + `HTTP2_REQUIRED` 提交即失败
+21. 四个平台编译通过
+22. **系统根证书在 macOS 与 Linux 上各做一次真实公网 HTTPS 运行测试** —— staticlib
+    编译通过只证明链接得上，不证明运行时能正确加载平台信任根
 
 APNs 真凭据 smoke 作为**可选外部测试**，不进普通单测。
 
