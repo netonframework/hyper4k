@@ -1,6 +1,11 @@
 # hyper4k ABI v4：Client 与 TLS
 
-> 状态：**设计待评审**，未开始实现。
+> 状态：**DESIGN FROZEN / IMPLEMENTATION NOT STARTED**
+> （2026-09-02 终审通过，五轮评审收敛）
+>
+> 冻结范围：Client TLS、HTTP/1.1 与 HTTP/2 ALPN、连接池、流式响应、背压、取消、
+> 超时、安全重试。
+> **不在本轮**：Server TLS、h2c client、mTLS、certificate pinning、trailers。
 >
 > 目标：给 Neton 的出站 `HttpClient` 一个 Rust 底座，支持 HTTPS、SNI、证书校验与
 > ALPN；解锁 APNs（强制 HTTP/2 over TLS）与公网 HTTPS 调用。当前 Neton 的
@@ -57,7 +62,9 @@ uint64_t hyper4k_server_capabilities(void);
 uint64_t hyper4k_client_capabilities(void);
 ```
 
-**只定义已经实现且有测试的位**，不预留猜测性能力。位一旦发出去含义就冻结。
+**一个位只有在对应能力实现完成、测试通过之后，才允许由 `capabilities` 返回。**
+不预留猜测性能力；位一旦发出去含义就冻结。本文档冻结的是位的含义，不是"这些能力
+已经存在" —— 实现尚未开始。
 
 所有配置结构体一律 `abi_version` + `struct_size` 前置，新增字段只能追加在尾部。
 规范定义见 §2.2（options）与 §2.6（request）—— **全文各只有一份**，不得在别处
@@ -558,7 +565,8 @@ Rust 侧自动化测试，全部用本地生成的 CA 与证书：
     最小 `struct_size` 被强制
 35. `on_chunk = NULL` 时正常收到 headers 与 `OnDone`，响应体被丢弃
 36. 大量 PAUSED stream 不会耗尽连接级窗口而拖死同连接的活跃 stream
-37. client 级总内存上限生效：超限时新请求得到 `HYPER4K_STATUS_OOM`，进程不 OOM
+37. client 级总内存上限生效：超限时新请求得到 `HYPER4K_STATUS_RESOURCE_EXHAUSTED`，
+    进程不 OOM
 38. `Hyper4kErrorKind` 各值与文档一致（跨语言常量比对，不靠自动递增）
 39. **跨版本结构体兼容双向验证**：
     - 旧的小结构体调用新库：`*_init(ptr, sizeof(old_struct))` 只写前缀，不越界
