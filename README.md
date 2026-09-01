@@ -131,7 +131,8 @@ Rust 底座收益最小——别用它来判断是否值得迁移。
 - [x] 异步 handoff：回调复制请求后立即返回，Kotlin/Native 协程处理 suspend handler
 - [x] 有界并发、请求超时与优雅停止
 - [ ] Multipart upload support
-- [ ] 流式 body / SSE relay（AI gateway：chunk transform、client disconnect、usage capture）
-- [ ] HTTP/2（`hyper::server::conn::http2`）
+- [x] 流式 body / SSE relay（真 socket 分块测试把关，缓冲实现会让构建失败）
+- [x] HTTP/2 prior-knowledge（h2c）：真实 client handshake + 请求派发 + 同连接并发 stream
+- [ ] HTTP/2 over TLS（ALPN 协商，随 TLS 能力一并）
 - [ ] 可选 `hyper4k-tower`：接入 Tower 生态（timeout / trace / load-shed）
 ```

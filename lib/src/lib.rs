@@ -984,6 +984,129 @@ mod tests {
         unsafe { hyper4k_server_stop(server) };
     }
 
+    /// Paths the h2 handler was actually invoked with, so the test can prove the
+    /// request reached the callback rather than being answered inside hyper.
+    fn h2_paths() -> &'static Mutex<Vec<String>> {
+        static PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        PATHS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    extern "C" fn h2_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
+        let path = unsafe {
+            let slice = &(*request).path;
+            String::from_utf8_lossy(std::slice::from_raw_parts(slice.ptr, slice.len)).into_owned()
+        };
+        h2_paths().lock().expect("paths lock").push(path.clone());
+
+        let body = format!("h2 body for {path}");
+        // No `Connection:` header here on purpose: it is a connection-specific header
+        // and illegal over HTTP/2.
+        let headers = b"Content-Type: text/plain\n";
+        unsafe {
+            hyper4k_respond(
+                (*request).responder,
+                201,
+                headers.as_ptr(),
+                headers.len(),
+                body.as_ptr(),
+                body.len(),
+            );
+        }
+    }
+
+    /// A full h2c round trip: real client handshake, real request, handler invoked,
+    /// status/headers/body read back.
+    ///
+    /// The preface test above only proves the server *speaks* h2 — it answers SETTINGS.
+    /// It would still pass if no request ever reached a handler, which is exactly the
+    /// gap that makes declaring `HTTP_2` on the strength of a handshake unsafe.
+    #[test]
+    fn serves_a_real_http2_request_over_prior_knowledge() {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Empty};
+        use hyper::Request;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        h2_paths().lock().expect("paths lock").clear();
+
+        let port = free_port();
+        let host = CString::new("127.0.0.1").expect("host");
+        let server =
+            unsafe { hyper4k_server_start(host.as_ptr(), port, h2_handler, std::ptr::null_mut()) };
+        assert!(!server.is_null());
+
+        let rt = tokio::runtime::Runtime::new().expect("client runtime");
+        rt.block_on(async move {
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(
+                TokioExecutor::new(),
+                TokioIo::new(tcp),
+            )
+            .await
+            .expect("h2 client handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/h2/single")
+                        .body(Empty::<Bytes>::new())
+                        .expect("request"),
+                )
+                .await
+                .expect("send request");
+
+            assert_eq!(response.status(), 201);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/plain"),
+            );
+            let body = response.into_body().collect().await.expect("body").to_bytes();
+            assert_eq!(&body[..], b"h2 body for /h2/single");
+
+            // Two concurrent streams multiplexed on the same connection.
+            let mut a = sender.clone();
+            let mut b = sender.clone();
+            let one = a.send_request(
+                Request::builder()
+                    .uri("/h2/one")
+                    .body(Empty::<Bytes>::new())
+                    .expect("request one"),
+            );
+            let two = b.send_request(
+                Request::builder()
+                    .uri("/h2/two")
+                    .body(Empty::<Bytes>::new())
+                    .expect("request two"),
+            );
+            let (res_one, res_two) = tokio::join!(one, two);
+            let res_one = res_one.expect("stream one");
+            let res_two = res_two.expect("stream two");
+            assert_eq!(res_one.status(), 201);
+            assert_eq!(res_two.status(), 201);
+            let body_one = res_one.into_body().collect().await.expect("body one").to_bytes();
+            let body_two = res_two.into_body().collect().await.expect("body two").to_bytes();
+            assert_eq!(&body_one[..], b"h2 body for /h2/one");
+            assert_eq!(&body_two[..], b"h2 body for /h2/two");
+        });
+
+        let seen = h2_paths().lock().expect("paths lock").clone();
+        assert_eq!(seen.len(), 3, "handler must run once per stream: {seen:?}");
+        assert!(seen.contains(&"/h2/single".to_string()), "{seen:?}");
+        assert!(seen.contains(&"/h2/one".to_string()), "{seen:?}");
+        assert!(seen.contains(&"/h2/two".to_string()), "{seen:?}");
+
+        unsafe { hyper4k_server_stop(server) };
+    }
+
     extern "C" fn test_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
         let body = b"hello from hyper4k";
         let headers = b"Content-Type: text/plain\nConnection: close\n";

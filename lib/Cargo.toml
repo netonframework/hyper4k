@@ -20,6 +20,11 @@ http-body-util = "0.1.5"
 bytes = "1.12.1"
 dashmap = "6.2.1"
 
+[dev-dependencies]
+# Test-only HTTP/2 client: proving h2c end to end needs a real client handshake,
+# not a hand-written preface. Cargo unifies these features into the test build only.
+hyper = { version = "1.11.1", features = ["client"] }
+
 [profile.release]
 opt-level = 3
 lto = true
