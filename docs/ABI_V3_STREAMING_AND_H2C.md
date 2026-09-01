@@ -260,7 +260,14 @@ override val capabilities = setOf(
 `write_after_client_disconnect_reports_client_gone`、
 `accepts_http2_prior_knowledge_connections`、
 `oneshot_and_streaming_are_mutually_exclusive`）。
-第 1、5 条要等 Kotlin 侧 live response 落地后在一致性套件里跑。
+第 2、3 条另有一份 Kotlin 侧的端到端覆盖：`src/appleTest` 的
+`Hyper4kStreamingSocketTest` 起真实服务器、走真实 socket，把
+`NativeResponseChannel` 的指针与长度编组也一起跑到——用假通道的那些测试
+到 Kotlin 边界就停了，这一跳此前从没执行过。
+
+第 1、5 条仍要等一致性套件：套件目前只有基座，一条具体断言都还没有，
+而且流式用例光靠 `roundTrip` 表达不了（它只有「请求进、响应出」，
+没有「客户端已经收到第几块」这个观测点），需要先补一个钩子。
 
 > 第 2 条那个测试值得说明它为什么不是时序巧合：handler 写完第 1 个事件后
 > 阻塞在一道闸门上，闸门只有在测试线程**确认收到**第 1 个事件之后才打开。
