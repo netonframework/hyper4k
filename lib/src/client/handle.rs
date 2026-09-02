@@ -6,8 +6,8 @@ use super::bridge::{
 use super::plaintext::PlaintextConnector;
 use super::pool::{Pool, PoolKey, Sender};
 use super::{
-    validate_header, Hyper4kClientOptions, Hyper4kClientRequest, HYPER4K_CLIENT_HTTP2_REQUIRED,
-    KNOWN_CLIENT_FLAGS, OPTIONS_MIN_SIZE, REQUEST_MIN_SIZE,
+    validate_header, Hyper4kClientOptions, Hyper4kClientRequest, HYPER4K_CLIENT_CA_REPLACE_SYSTEM,
+    HYPER4K_CLIENT_HTTP2_REQUIRED, KNOWN_CLIENT_FLAGS, OPTIONS_MIN_SIZE, REQUEST_MIN_SIZE,
 };
 use crate::abi::*;
 use bytes::Bytes;
@@ -21,7 +21,9 @@ use tokio::runtime::Runtime;
 
 pub struct Hyper4kClient {
     runtime: Option<Runtime>,
+    /// One pool per transport. A connection is never shared across schemes.
     pool: Arc<Pool>,
+    tls_pool: Option<Arc<Pool>>,
     requests: Arc<DashMap<u64, Arc<RequestHandle>>>,
     next_id: AtomicU64,
     closed: Arc<AtomicBool>,
@@ -111,9 +113,28 @@ pub unsafe extern "C" fn hyper4k_client_new(
         0 => None,
         ms => Some(Duration::from_millis(ms)),
     };
+    let custom_ca = if o.custom_ca_pem.is_null() || o.custom_ca_pem_len == 0 {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(o.custom_ca_pem, o.custom_ca_pem_len).to_vec())
+    };
+    let tls_opts = super::tls::TlsOptions {
+        custom_ca_pem: custom_ca,
+        replace_system_roots: o.flags & HYPER4K_CLIENT_CA_REPLACE_SYSTEM != 0,
+        require_h2: o.flags & HYPER4K_CLIENT_HTTP2_REQUIRED != 0,
+        connect_timeout,
+    };
+    // Built eagerly: a bad CA bundle should fail at construction, not on the
+    // first request where it looks like a network problem.
+    let tls_pool = match super::tls::TlsClientConnector::new(&tls_opts) {
+        Ok(c) => Some(Arc::new(Pool::new(Arc::new(c)))),
+        Err(_) => None,
+    };
+
     let client = Hyper4kClient {
         runtime: Some(runtime),
         pool: Arc::new(Pool::new(Arc::new(PlaintextConnector { connect_timeout }))),
+        tls_pool,
         requests: Arc::new(DashMap::new()),
         next_id: AtomicU64::new(1),
         closed: Arc::new(AtomicBool::new(false)),
@@ -151,8 +172,14 @@ pub unsafe extern "C" fn hyper4k_client_close(client: *mut Hyper4kClient) {
         }
     }
     let pool = c.pool.clone();
+    let tls_pool = c.tls_pool.clone();
     if let Some(rt) = c.runtime.as_ref() {
-        rt.spawn(async move { pool.shutdown().await });
+        rt.spawn(async move {
+            pool.shutdown().await;
+            if let Some(p) = tls_pool {
+                p.shutdown().await;
+            }
+        });
     }
 }
 
@@ -237,10 +264,6 @@ pub unsafe extern "C" fn hyper4k_client_send(
     if scheme == "http" && c.http2_required() {
         return HYPER4K_STATUS_UNSUPPORTED;
     }
-    if scheme == "https" {
-        // TLS lands in Task 5; refusing is honest, silently downgrading is not.
-        return HYPER4K_STATUS_UNSUPPORTED;
-    }
 
     let mut headers = Vec::with_capacity(r.header_count);
     if r.header_count > 0 {
@@ -296,7 +319,14 @@ pub unsafe extern "C" fn hyper4k_client_send(
     // Written before anything can fire, per contract point 1.
     *out_request_id = id;
 
-    let pool = c.pool.clone();
+    let pool = if scheme == "https" {
+        match c.tls_pool.clone() {
+            Some(p) => p,
+            None => return HYPER4K_STATUS_UNSUPPORTED,
+        }
+    } else {
+        c.pool.clone()
+    };
     let h = handle.clone();
     let task = rt.spawn(async move {
         run_request(pool, key, template, sink, h).await;

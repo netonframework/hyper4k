@@ -7,11 +7,14 @@ pub(crate) mod bridge;
 pub(crate) mod handle;
 pub(crate) mod plaintext;
 pub(crate) mod pool;
+pub(crate) mod tls;
 
 #[cfg(test)]
-mod handle_tests;
+pub(crate) mod handle_tests;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(test)]
+mod tls_tests;
 
 pub use handle::Hyper4kClient;
 

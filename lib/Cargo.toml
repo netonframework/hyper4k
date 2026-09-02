@@ -19,6 +19,19 @@ hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", 
 http-body-util = "0.1.5"
 bytes = "1.12.1"
 dashmap = "6.2.1"
+# Exactly one crypto provider is compiled in. aws-lc-rs is rustls's default and
+# leaves room for FIPS and post-quantum later; its non-FIPS build needs a C
+# compiler but not cmake (verified on all four target platforms).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+
+[dev-dependencies]
+# Throwaway CAs and leaf certificates per test: nothing expires in the repo, and
+# the "expired certificate" case can be produced deliberately.
+rcgen = "0.13"
+time = "0.3"
 
 [profile.release]
 opt-level = 3

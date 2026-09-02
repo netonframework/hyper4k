@@ -106,6 +106,28 @@ fn slice_of(b: &[u8]) -> crate::Hyper4kSlice {
     }
 }
 
+pub fn new_client_with_ca(ca_pem: &str, flags: u64) -> *mut Hyper4kClient {
+    let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_options_init(&mut o, std::mem::size_of::<Hyper4kClientOptions>() as u32)
+    };
+    o.flags = flags;
+    o.custom_ca_pem = ca_pem.as_ptr();
+    o.custom_ca_pem_len = ca_pem.len();
+    let mut c = std::ptr::null_mut();
+    assert_eq!(unsafe { hyper4k_client_new(&o, &mut c) }, HYPER4K_STATUS_OK);
+    c
+}
+
+/// Send one request and block until it settles.
+pub fn send_and_wait(client: *mut Hyper4kClient, url: &str) -> Arc<Capture> {
+    let cap = Arc::new(Capture::default());
+    let (st, _) = send(client, url, &cap, Some(on_chunk));
+    assert_eq!(st, HYPER4K_STATUS_OK, "submission failed for {url}");
+    wait_until(|| cap.done.lock().unwrap().is_some());
+    cap
+}
+
 fn new_client(flags: u64) -> *mut Hyper4kClient {
     let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
     unsafe {
@@ -115,11 +137,6 @@ fn new_client(flags: u64) -> *mut Hyper4kClient {
     let mut c = std::ptr::null_mut();
     assert_eq!(unsafe { hyper4k_client_new(&o, &mut c) }, HYPER4K_STATUS_OK);
     c
-}
-
-struct Sent {
-    id: u64,
-    _url: String,
 }
 
 fn send(
