@@ -728,15 +728,22 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn concurrent_acquires_dial_once() {
+    async fn concurrent_h1_acquires_are_bounded_not_unbounded() {
+        // NOT "dial once": h1 connections are exclusive, so 16 concurrent
+        // acquires that all hold their lease genuinely need 16 connections.
+        // Demanding accept_count == 1 here would either deadlock (waiting for a
+        // lease that join_all cannot release) or contradict exclusivity.
+        // What the pool owes us is a *cap*, not deduplication.
         let peer = spawn_h1_server_counting_accepts().await;
-        let pool = Pool::new(plaintext_only());
+        let pool = Pool::new(plaintext_only()).with_max_connections_per_key(4);
         let key = key_for(&peer);
         let leases = futures::future::join_all(
             (0..16).map(|_| pool.acquire(&key))
         ).await;
-        assert!(leases.iter().all(|l| l.is_ok()));
-        assert_eq!(peer.accept_count(), 1, "connection storm: dialed more than once");
+        // 4 succeed and hold connections; the rest wait or fail, but the pool
+        // never opens more than the cap.
+        assert!(peer.accept_count() <= 4,
+                "h1 pool exceeded its per-authority connection cap");
     }
 
     #[tokio::test]
@@ -773,6 +780,20 @@ mod pool_tests {
         let a = pool.acquire(&key).await.unwrap();
         let b = pool.acquire(&key).await.unwrap();
         assert_eq!(a.conn_id, b.conn_id, "h2 must multiplex, not redial");
+    }
+
+    #[tokio::test]
+    async fn concurrent_h2_acquires_dial_once() {
+        // Dial de-duplication only makes sense where connections multiplex.
+        let connector = fake_h2_connector_counting_dials();
+        let pool = Pool::new(connector.clone());
+        let key = fake_key();
+        let leases = futures::future::join_all(
+            (0..16).map(|_| pool.acquire(&key))
+        ).await;
+        assert!(leases.iter().all(|l| l.is_ok()));
+        assert_eq!(connector.dial_count(), 1,
+                   "connection storm: dialed more than once for one authority");
     }
 
     #[tokio::test]
@@ -838,7 +859,7 @@ the connection driver and stores its `JoinHandle`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd lib && cargo test --lib client::pool_tests`
-Expected: PASS, 10 tests
+Expected: PASS, 11 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1021,6 +1042,97 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn a_normal_completion_drains_the_queued_body_before_done() {
+        // Teeth for DrainThenDone. The server sends the whole response and
+        // closes; by the time the request settles, headers and chunks are
+        // already sitting in the bridge queue. Discarding them would leave the
+        // caller with an empty 200, which is exactly the bug this mode exists
+        // to prevent — and a fast test without a backlog would not notice.
+        let addr = spawn_server_sending_then_closing(b"abc", b"def");
+        let cap = Arc::new(Capture::default());
+        let client = new_client_with_paused_bridge();   // events queue, none drain yet
+        let id = send_on(client, &format!("http://{addr}/x"), cap.clone());
+        wait_until(|| bridge_backlog(client, id) >= 3); // headers + 2 chunks
+        release_bridge(client);
+        wait_until(|| cap.done.lock().unwrap().is_some());
+
+        assert_eq!(cap.headers_calls(), 1, "queued headers were dropped on success");
+        assert_eq!(&*cap.body.lock().unwrap(), b"abcdef", "queued body was dropped");
+        assert_eq!(*cap.done.lock().unwrap(), Some(-999));
+        assert!(cap.done_was_last(), "OnDone must be the final event");
+        unsafe { hyper4k_client_close(client) };
+        unsafe { hyper4k_client_free(client) };
+    }
+
+    #[test]
+    fn cancelling_with_a_backlog_discards_it_and_reports_once() {
+        // Teeth for DiscardThenDone, same backlog, opposite expectation.
+        let addr = spawn_server_sending_then_closing(b"abc", b"def");
+        let cap = Arc::new(Capture::default());
+        let client = new_client_with_paused_bridge();
+        let id = send_on(client, &format!("http://{addr}/x"), cap.clone());
+        wait_until(|| bridge_backlog(client, id) >= 3);
+        assert_eq!(unsafe { hyper4k_client_cancel(client, id) }, HYPER4K_OK);
+        release_bridge(client);
+        wait_until(|| cap.done.lock().unwrap().is_some());
+
+        assert_eq!(cap.headers_calls(), 0, "stale headers were delivered after cancel");
+        assert!(cap.body.lock().unwrap().is_empty(), "stale body was delivered");
+        assert_eq!(*cap.done.lock().unwrap(), Some(HYPER4K_ERR_CANCELLED));
+        assert_eq!(cap.done_calls(), 1, "OnDone fired more than once");
+        unsafe { hyper4k_client_close(client) };
+        unsafe { hyper4k_client_free(client) };
+    }
+
+    #[test]
+    fn a_callback_never_re_enters_the_send_thread() {
+        // Spec §2.6 contract 2. Record the sending thread, assert no callback
+        // runs on it synchronously inside send().
+        let addr = spawn_echo_server();
+        let cap = Arc::new(Capture::default());
+        let client = new_default_client();
+        let sender_thread = std::thread::current().id();
+        cap.forbid_thread(sender_thread);        // callbacks assert against this
+        let id = send_on(client, &format!("http://{addr}/ping"), cap.clone());
+        let _ = id;
+        wait_until(|| cap.done.lock().unwrap().is_some());
+        assert!(!cap.reentered_forbidden_thread(),
+                "a callback ran synchronously on the send() thread");
+        unsafe { hyper4k_client_close(client) };
+        unsafe { hyper4k_client_free(client) };
+    }
+
+    #[test]
+    fn send_racing_close_yields_either_a_refusal_or_exactly_one_done() {
+        // The frozen either/or from spec §2.3, hammered rather than assumed.
+        for _ in 0..200 {
+            let addr = spawn_echo_server();
+            let cap = Arc::new(Capture::default());
+            let client = new_default_client();
+            let c2 = client as usize;
+            let closer = std::thread::spawn(move || {
+                unsafe { hyper4k_client_close(c2 as *mut Hyper4kClient) };
+            });
+            let mut id = 0u64;
+            let st = unsafe {
+                hyper4k_client_send(client, &get_request(&format!("http://{addr}/ping")),
+                                    on_headers, on_chunk, on_done,
+                                    Arc::as_ptr(&cap) as *mut c_void, &mut id)
+            };
+            closer.join().unwrap();
+            if st == HYPER4K_OK {
+                wait_until(|| cap.done.lock().unwrap().is_some());
+                assert_eq!(cap.done_calls(), 1, "accepted request must settle exactly once");
+            } else {
+                assert_eq!(st, HYPER4K_STATUS_CLIENT_CLOSED);
+                assert!(cap.done.lock().unwrap().is_none(),
+                        "refused request must produce no callback");
+            }
+            unsafe { hyper4k_client_free(client) };
+        }
+    }
+
+    #[test]
     fn http_scheme_with_http2_required_is_refused_at_submit() {
         let client = new_client_with_flags(HYPER4K_CLIENT_HTTP2_REQUIRED);
         let req = get_request("http://127.0.0.1:1/x");
@@ -1121,7 +1233,7 @@ handle map is empty, then drops the runtime.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd lib && cargo test --lib client::lifecycle_tests`
-Expected: PASS, 6 tests
+Expected: PASS, 10 tests
 
 - [ ] **Step 5: Turn on the capability bits this task earned**
 
@@ -1231,8 +1343,10 @@ mod tls_tests {
     }
 
     #[test]
-    fn custom_ca_appends_to_system_roots_by_default() {
-        // A private CA is trusted, and a public host still validates.
+    fn custom_ca_is_trusted_without_replace() {
+        // Only proves the private CA is added. That the *system* roots survived
+        // cannot be shown here — there is no publicly-signed peer offline.
+        // Task 8's ignored public test covers that half.
         let peer = spawn_tls_server(TlsFixture::valid());
         let client = new_client_with_ca(peer.ca_pem(), 0);
         let cap = send_and_wait(client, &format!("https://localhost:{}/x", peer.port));
@@ -1268,6 +1382,21 @@ mod tls_tests {
                          Sender::H1(_)));
     }
 
+    #[tokio::test]
+    async fn two_concurrent_h2_requests_share_one_real_tls_connection() {
+        // The fake connector in Task 3 proves the bookkeeping. Only this proves
+        // ALPN, handshake and real multiplexing actually close the loop.
+        let peer = spawn_tls_server_alpn(&["h2"]).await;
+        let client = new_client_with_ca(peer.ca_pem(), 0);
+        let a = send_async(client, &format!("https://localhost:{}/a", peer.port));
+        let b = send_async(client, &format!("https://localhost:{}/b", peer.port));
+        let (ra, rb) = tokio::join!(a, b);
+        assert_eq!(ra.status(), 200);
+        assert_eq!(rb.status(), 200);
+        assert_eq!(peer.accept_count(), 1,
+                   "two h2 requests opened two TLS connections");
+    }
+
     #[test]
     fn unknown_flag_bits_are_rejected() {
         let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
@@ -1299,7 +1428,7 @@ Wire the connector into the client built in Task 3.
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `cd lib && cargo test --lib client::tls_tests`
-Expected: PASS, 10 tests
+Expected: PASS, 11 tests
 
 - [ ] **Step 6: Turn on the earned capability bits and commit**
 
@@ -1791,7 +1920,7 @@ Task 8's Kotlin and C static assertions; 42 → Task 2.
 expected pass/fail string.
 
 **Type consistency.** `Hyper4kStatus`, `Hyper4kErrorKind`, `Hyper4kHeadersAction`,
-`Hyper4kChunkAction` are declared in Task 1 and used unchanged in Tasks 2–6.
+`Hyper4kChunkAction` are declared in Task 1 and used unchanged in Tasks 2–7.
 `Hyper4kClientOptions` and `Hyper4kClientRequest` are declared once in Task 2 and
 consumed by name thereafter. `hyper4k_client_resume` appears only in Task 6, where
 it is defined.
