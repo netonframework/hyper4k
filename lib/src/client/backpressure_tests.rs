@@ -203,9 +203,9 @@ fn start(client: *mut Hyper4kClient, url: &str, ctl: &Arc<Ctl>) -> u64 {
         hyper4k_client_send(
             client,
             &r,
-            on_headers,
+            Some(on_headers),
             Some(on_chunk),
-            on_done,
+            Some(on_done),
             Arc::as_ptr(ctl) as *mut c_void,
             &mut id,
         )

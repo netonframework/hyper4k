@@ -2,16 +2,18 @@
 
 > 状态：
 > ```
-> CLIENT TLS CORE:              IMPLEMENTED
-> PUBLIC ABI AND RESOURCE CONTRACT: INCOMPLETE
-> RELEASE READINESS:            BLOCKED
+> CLIENT TLS CORE:    IMPLEMENTED
+> PUBLIC ABI:         IMPLEMENTED
+> RESOURCE CONTRACT:  INCOMPLETE
+> RELEASE READINESS:  BLOCKED
 > ```
-> Rust 侧 85 个测试全绿，但那只覆盖了 Rust 内部。对外的 C 头文件尚未声明 client
-> API，因此没有任何消费方能真正接入 —— 单测的绿色不构成"已实现"。
+> C 头文件已声明完整 client API，并有一条穿过它跑 new → send → callbacks →
+> close → free 的 Kotlin 契约测试。`free()` 是确定性等待（bridge 计数归零），
+> 没有超时。
 >
-> 冻结范围：Client TLS、HTTP/1.1 与 HTTP/2 ALPN、连接池、流式响应、背压、取消、
-> 超时、安全重试。
-> **不在本轮**：Server TLS、h2c client、mTLS、certificate pinning、trailers。
+> 仍阻塞的是资源模型：client 级内存 / 请求上限未接（`RESOURCE_EXHAUSTED` 在生产
+> 路径从未返回过）、每请求一个阻塞 worker、HTTP/2 连接窗口预留没有落到 builder
+> 的 `initial_connection_window_size`。
 >
 > 目标：给 Neton 的出站 `HttpClient` 一个 Rust 底座，支持 HTTPS、SNI、证书校验与
 > ALPN；解锁 APNs（强制 HTTP/2 over TLS）与公网 HTTPS 调用。当前 Neton 的

@@ -243,9 +243,9 @@ fn send_method(
         hyper4k_client_send(
             client,
             &r,
-            on_headers,
+            Some(on_headers),
             Some(on_chunk),
-            on_done,
+            Some(on_done),
             Arc::as_ptr(cap) as *mut c_void,
             &mut id,
         )

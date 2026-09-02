@@ -157,9 +157,9 @@ fn send(
         hyper4k_client_send(
             client,
             &r,
-            on_headers,
+            Some(on_headers),
             chunk,
-            on_done,
+            Some(on_done),
             Arc::as_ptr(cap) as *mut c_void,
             &mut id,
         )
@@ -483,9 +483,9 @@ fn an_illegal_header_is_rejected_instead_of_aborting_the_process() {
         hyper4k_client_send(
             client,
             &r,
-            on_headers,
+            Some(on_headers),
             Some(on_chunk),
-            on_done,
+            Some(on_done),
             Arc::as_ptr(&cap) as *mut c_void,
             &mut id,
         )
@@ -517,9 +517,9 @@ fn an_illegal_header_value_is_also_rejected() {
         hyper4k_client_send(
             client,
             &r,
-            on_headers,
+            Some(on_headers),
             Some(on_chunk),
-            on_done,
+            Some(on_done),
             Arc::as_ptr(&cap) as *mut c_void,
             &mut id,
         )
@@ -568,5 +568,104 @@ fn a_bad_ca_bundle_fails_at_construction_not_on_first_request() {
         unsafe { hyper4k_client_new(&o, &mut client) },
         HYPER4K_STATUS_INVALID_ARG,
         "a bad CA bundle was accepted and deferred to the first request"
+    );
+}
+
+#[test]
+fn null_required_callbacks_are_rejected() {
+    // Taken as Option precisely so a C NULL is a value we can inspect. With a
+    // non-nullable fn pointer the parameter would already be an invalid Rust
+    // value before any check could run.
+    let client = new_client(0);
+    let url = "http://127.0.0.1:1/x";
+    let mut r: Hyper4kClientRequest = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_request_init(&mut r, std::mem::size_of::<Hyper4kClientRequest>() as u32)
+    };
+    r.method = slice_of(b"GET");
+    r.url = slice_of(url.as_bytes());
+    let mut id = 0u64;
+
+    let no_headers = unsafe {
+        hyper4k_client_send(
+            client,
+            &r,
+            None,
+            Some(on_chunk),
+            Some(on_done),
+            std::ptr::null_mut(),
+            &mut id,
+        )
+    };
+    assert_eq!(no_headers, HYPER4K_STATUS_INVALID_ARG);
+
+    let no_done = unsafe {
+        hyper4k_client_send(
+            client,
+            &r,
+            Some(on_headers),
+            Some(on_chunk),
+            None,
+            std::ptr::null_mut(),
+            &mut id,
+        )
+    };
+    assert_eq!(no_done, HYPER4K_STATUS_INVALID_ARG);
+    unsafe { hyper4k_client_free(client) };
+}
+
+#[test]
+fn free_waits_for_a_slow_callback_instead_of_racing_it() {
+    // The whole point of a deterministic wait: a callback that outlives free()
+    // would touch a user_data the caller is entitled to have reclaimed.
+    //
+    // Caveat, verified by injecting the bug: this test alone does NOT prove
+    // wait_zero is what provides the guarantee. Dropping the tokio runtime also
+    // joins blocking tasks, so replacing wait_zero with a short sleep still
+    // passes here. BridgeCounter is therefore unit-tested directly in
+    // bridge::counter_tests; this case covers the end-to-end property.
+    use std::sync::atomic::AtomicBool;
+    static IN_CALLBACK: AtomicBool = AtomicBool::new(false);
+    static CALLBACK_FINISHED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn slow_done(_ud: *mut c_void, _id: u64, _e: *const Hyper4kError) {
+        IN_CALLBACK.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(400));
+        CALLBACK_FINISHED.store(true, Ordering::SeqCst);
+    }
+
+    let r = rt();
+    let addr = r.block_on(echo_server(b"pong"));
+    let client = new_client(0);
+    let cap = Arc::new(Capture::default());
+
+    let url = format!("http://{addr}/ping");
+    let mut req: Hyper4kClientRequest = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_request_init(&mut req, std::mem::size_of::<Hyper4kClientRequest>() as u32)
+    };
+    req.method = slice_of(b"GET");
+    req.url = slice_of(url.as_bytes());
+    let mut id = 0u64;
+    assert_eq!(
+        unsafe {
+            hyper4k_client_send(
+                client,
+                &req,
+                Some(on_headers),
+                Some(on_chunk),
+                Some(slow_done),
+                Arc::as_ptr(&cap) as *mut c_void,
+                &mut id,
+            )
+        },
+        HYPER4K_STATUS_OK
+    );
+
+    wait_until(|| IN_CALLBACK.load(Ordering::SeqCst));
+    unsafe { hyper4k_client_free(client) };
+    assert!(
+        CALLBACK_FINISHED.load(Ordering::SeqCst),
+        "free() returned while a callback was still running"
     );
 }

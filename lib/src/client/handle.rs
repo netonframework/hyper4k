@@ -32,6 +32,7 @@ pub struct Hyper4kClient {
     connect_timeout: Option<Duration>,
     queue_capacity: usize,
     h2_required: bool,
+    bridges: Arc<bridge::BridgeCounter>,
     max_retries: u32,
     request_timeout: Option<Duration>,
     read_idle_timeout: Option<Duration>,
@@ -172,6 +173,7 @@ pub unsafe extern "C" fn hyper4k_client_new(
         connect_timeout,
         queue_capacity: 8,
         h2_required: o.flags & HYPER4K_CLIENT_HTTP2_REQUIRED != 0,
+        bridges: Arc::new(bridge::BridgeCounter::default()),
         max_retries: o.max_retries,
         request_timeout: (o.request_timeout_ms != 0)
             .then(|| Duration::from_millis(o.request_timeout_ms)),
@@ -231,13 +233,24 @@ pub unsafe extern "C" fn hyper4k_client_free(client: *mut Hyper4kClient) {
     }
     hyper4k_client_close(client);
     let mut boxed = Box::from_raw(client);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !boxed.requests.is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
+
+    // Wait for every bridge to finish its OnDone. No timeout: freeing while a
+    // callback is still running would hand the caller a dangling user_data,
+    // and no deadline makes that safe.
+    boxed.bridges.wait_zero();
+
+    // Only then tear down the transport and the runtime.
+    let pool = boxed.pool.clone();
+    let tls_pool = boxed.tls_pool.clone();
+    if let Some(rt) = boxed.runtime.as_ref() {
+        rt.block_on(async {
+            pool.shutdown().await;
+            if let Some(p) = tls_pool {
+                p.shutdown().await;
+            }
+        });
     }
-    if let Some(rt) = boxed.runtime.take() {
-        rt.shutdown_timeout(Duration::from_secs(5));
-    }
+    drop(boxed.runtime.take());
 }
 
 /// Submit a request.
@@ -253,15 +266,21 @@ pub unsafe extern "C" fn hyper4k_client_free(client: *mut Hyper4kClient) {
 pub unsafe extern "C" fn hyper4k_client_send(
     client: *mut Hyper4kClient,
     request: *const Hyper4kClientRequest,
-    on_headers: OnHeaders,
+    on_headers: Option<OnHeaders>,
     on_chunk: Option<OnChunk>,
-    on_done: OnDone,
+    on_done: Option<OnDone>,
     user_data: *mut c_void,
     out_request_id: *mut u64,
 ) -> Hyper4kStatus {
     if client.is_null() || request.is_null() || out_request_id.is_null() {
         return HYPER4K_STATUS_INVALID_ARG;
     }
+    // Taken as Option so a C NULL is a value we can inspect. A non-nullable
+    // `extern "C" fn` would already be an invalid Rust value on entry — the
+    // check would come too late to mean anything.
+    let (Some(on_headers), Some(on_done)) = (on_headers, on_done) else {
+        return HYPER4K_STATUS_INVALID_ARG;
+    };
     let c = &*client;
     let raw_size = std::ptr::read_unaligned(
         (request as *const u8).add(std::mem::size_of::<u32>()) as *const u32
@@ -353,9 +372,13 @@ pub unsafe extern "C" fn hyper4k_client_send(
     let id = c.next_id.fetch_add(1, Ordering::SeqCst);
 
     let requests = c.requests.clone();
+    let bridges = c.bridges.clone();
+    bridges.enter();
     let cleanup_id = id;
     let cleanup = move || {
         requests.remove(&cleanup_id);
+        // After OnDone has returned: only now may free() proceed.
+        bridges.leave();
     };
     let rt = c.runtime.as_ref().expect("runtime present until free");
     let (handle, sink, _worker) = bridge::spawn(

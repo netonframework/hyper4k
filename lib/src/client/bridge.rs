@@ -181,6 +181,16 @@ impl RequestState {
         !self.discarding()
     }
 
+    /// Downgrade an already-claimed terminal to "discard" so a parked bridge
+    /// stops holding queued events during shutdown.
+    fn force_discard(&self) {
+        self.state_store_discard();
+    }
+
+    fn state_store_discard(&self) {
+        self.state.store(TERMINAL_DISCARD, Ordering::SeqCst);
+    }
+
     fn release_park(&self) {
         let mut parked = self.parked.lock().unwrap();
         *parked = false;
@@ -235,6 +245,14 @@ impl RequestHandle {
     /// Tokio task does not run ordinary cleanup.
     pub(crate) fn settle(&self, terminal: Terminal, discard: bool) {
         if !self.state.claim(discard) {
+            // Someone else already settled. If this is a shutdown and the
+            // bridge is parked behind a consumer's pause, it still has to be
+            // released: a request that completed normally *and* is parked would
+            // otherwise never finish, and free() would wait for it forever.
+            if discard {
+                self.state.force_discard();
+                self.state.release_park();
+            }
             return;
         }
         // 3. close the event producer
@@ -252,6 +270,48 @@ impl RequestHandle {
         // 6. only now stop the network task
         if let Some(h) = self.abort.lock().unwrap().take() {
             h.abort();
+        }
+    }
+}
+
+/// Counts bridges that can still invoke a callback.
+///
+/// `free()` waits on this reaching zero. Deterministic, not a timeout: a
+/// deadline that expires and frees anyway is a `user_data` use-after-free with
+/// extra steps.
+pub(crate) struct BridgeCounter {
+    n: StdMutex<u32>,
+    cv: Condvar,
+}
+
+impl Default for BridgeCounter {
+    fn default() -> Self {
+        BridgeCounter {
+            n: StdMutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+impl BridgeCounter {
+    pub(crate) fn enter(&self) {
+        *self.n.lock().unwrap() += 1;
+    }
+
+    /// Called after `OnDone` has returned, so the count reaching zero really
+    /// does mean no callback can still be running.
+    pub(crate) fn leave(&self) {
+        let mut n = self.n.lock().unwrap();
+        *n -= 1;
+        if *n == 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    pub(crate) fn wait_zero(&self) {
+        let mut n = self.n.lock().unwrap();
+        while *n != 0 {
+            n = self.cv.wait(n).unwrap();
         }
     }
 }
@@ -385,5 +445,42 @@ fn deliver_done(cb: &Callbacks, id: u64, t: &Terminal) {
             },
         };
         (cb.on_done)(cb.user_data.0, id, &err);
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+    #[test]
+    fn wait_zero_blocks_until_the_last_bridge_leaves() {
+        let c = Arc::new(BridgeCounter::default());
+        c.enter();
+        c.enter();
+        let left = Arc::new(AtomicBool::new(false));
+
+        let c2 = c.clone();
+        let l2 = left.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            c2.leave();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            l2.store(true, AOrd::SeqCst);
+            c2.leave();
+        });
+
+        c.wait_zero();
+        assert!(
+            left.load(AOrd::SeqCst),
+            "wait_zero returned before the last bridge left"
+        );
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn wait_zero_returns_immediately_when_nothing_is_active() {
+        let c = BridgeCounter::default();
+        c.wait_zero();
     }
 }
