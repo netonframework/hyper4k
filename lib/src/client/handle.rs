@@ -335,6 +335,25 @@ pub unsafe extern "C" fn hyper4k_client_send(
     HYPER4K_STATUS_OK
 }
 
+/// Resume a paused response body. Idempotent, callback-thread safe, non-blocking.
+///
+/// # Safety
+/// `client` must be a live client.
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_client_resume(
+    client: *mut Hyper4kClient,
+    request_id: u64,
+) -> Hyper4kStatus {
+    if client.is_null() {
+        return HYPER4K_STATUS_INVALID_ARG;
+    }
+    let c = &*client;
+    let Some(h) = c.requests.get(&request_id) else {
+        return HYPER4K_STATUS_NOT_FOUND;
+    };
+    h.state.resume()
+}
+
 /// Cancel a request. Idempotent, callback-thread safe, non-blocking.
 ///
 /// # Safety

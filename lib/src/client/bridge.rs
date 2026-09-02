@@ -7,8 +7,8 @@
 use crate::abi::*;
 use bytes::Bytes;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 pub(crate) type OnHeaders =
@@ -58,8 +58,16 @@ pub(crate) struct RequestState {
     state: AtomicU8,
     /// Set once the first response event is queued. Irreversible, and the only
     /// signal that exists on the committed path (see spec §四).
-    committed: std::sync::atomic::AtomicBool,
+    committed: AtomicBool,
     pub finished: Arc<Notify>,
+    /// True while a chunk callback is executing. An early `resume` arriving in
+    /// that window must be remembered, or the stream parks forever.
+    in_callback: AtomicBool,
+    /// A resume that arrived before the pause landed. It belongs to the current
+    /// chunk only: leaking it forward would silently release a later pause.
+    permit: AtomicBool,
+    parked: StdMutex<bool>,
+    unpark: Condvar,
 }
 
 impl RequestState {
@@ -67,8 +75,12 @@ impl RequestState {
         RequestState {
             id,
             state: AtomicU8::new(RUNNING),
-            committed: std::sync::atomic::AtomicBool::new(false),
+            committed: AtomicBool::new(false),
             finished: Arc::new(Notify::new()),
+            in_callback: AtomicBool::new(false),
+            permit: AtomicBool::new(false),
+            parked: StdMutex::new(false),
+            unpark: Condvar::new(),
         }
     }
 
@@ -99,6 +111,66 @@ impl RequestState {
 
     fn discarding(&self) -> bool {
         self.state.load(Ordering::SeqCst) == TERMINAL_DISCARD
+    }
+
+    /// Resume a paused response body.
+    ///
+    /// The permit exists because `PAUSE` is only observable after the callback
+    /// returns: a consumer that finishes early and calls `resume` from inside
+    /// its own callback would otherwise be ignored and the stream would hang.
+    pub(crate) fn resume(&self) -> Hyper4kStatus {
+        // Parked is checked FIRST. After a normal completion the request is
+        // "terminal" on the network side while the consumer still has queued
+        // data waiting behind its own pause; reporting ALREADY_DONE there would
+        // strand that data with no way to ask for it.
+        let mut parked = self.parked.lock().unwrap();
+        if *parked {
+            *parked = false;
+            self.unpark.notify_all();
+            return HYPER4K_STATUS_OK;
+        }
+        drop(parked);
+        if self.in_callback.load(Ordering::SeqCst) {
+            // Remembered for THIS chunk only; the worker clears it otherwise.
+            self.permit.store(true, Ordering::SeqCst);
+            return HYPER4K_STATUS_OK;
+        }
+        if self.is_terminal() {
+            return HYPER4K_STATUS_ALREADY_DONE;
+        }
+        HYPER4K_STATUS_NOT_PAUSED
+    }
+
+    /// Park until resumed or aborted. Returns false only when aborted.
+    ///
+    /// A *normal* completion must NOT release the pause. The network side
+    /// finishing only means no more data is coming; whatever is already queued
+    /// still belongs to the consumer, who asked us to hold it. Treating any
+    /// terminal state as a release made backpressure vanish for small
+    /// responses, because the body ended before the consumer resumed.
+    fn park(&self) -> bool {
+        // An early resume consumes the pause outright: no parking, no lost
+        // wakeup, and nothing left over to release a future pause.
+        if self.permit.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        let mut parked = self.parked.lock().unwrap();
+        *parked = true;
+        while *parked && !self.discarding() {
+            parked = self.unpark.wait(parked).unwrap();
+        }
+        *parked = false;
+        !self.discarding()
+    }
+
+    fn release_park(&self) {
+        let mut parked = self.parked.lock().unwrap();
+        *parked = false;
+        self.unpark.notify_all();
+    }
+
+    fn clear_permit(&self) {
+        self.permit.store(false, Ordering::SeqCst);
     }
 }
 
@@ -153,6 +225,12 @@ impl RequestHandle {
         if let Some(tx) = self.done_tx.lock().unwrap().take() {
             let _ = tx.send(terminal);
         }
+        // Abort paths must release a paused request: waiting for a consumer that
+        // has walked away would let one stream block hyper4k_client_free
+        // forever. A normal completion deliberately does not — see `park`.
+        if discard {
+            self.state.release_park();
+        }
         // 6. only now stop the network task
         if let Some(h) = self.abort.lock().unwrap().take() {
             h.abort();
@@ -195,16 +273,34 @@ pub(crate) fn spawn(
             if worker_state.discarding() {
                 continue; // drained and dropped, never delivered
             }
+            worker_state.in_callback.store(true, Ordering::SeqCst);
             let action = deliver(&cb, id, ev);
-            if action == Some(HYPER4K_CHUNK_CANCEL) {
-                worker_handle.settle(
-                    Terminal {
-                        kind: HYPER4K_ERR_CANCELLED,
-                        protocol_code: 0,
-                        message: "cancelled by callback".into(),
-                    },
-                    true,
-                );
+            worker_state.in_callback.store(false, Ordering::SeqCst);
+
+            match action {
+                Some(a) if a == HYPER4K_CHUNK_CANCEL => {
+                    worker_state.clear_permit();
+                    worker_handle.settle(
+                        Terminal {
+                            kind: HYPER4K_ERR_CANCELLED,
+                            protocol_code: 0,
+                            message: "cancelled by callback".into(),
+                        },
+                        true,
+                    );
+                }
+                Some(a) if a == HYPER4K_CHUNK_PAUSE => {
+                    // Pause means "this chunk is consumed, hold the next one".
+                    // Nothing is replayed on resume.
+                    if !worker_state.park() {
+                        continue;
+                    }
+                }
+                _ => {
+                    // CONTINUE, or a headers action: a permit taken during this
+                    // callback does not survive it.
+                    worker_state.clear_permit();
+                }
             }
         }
         let terminal = done_rx.blocking_recv().unwrap_or(Terminal {
@@ -242,8 +338,15 @@ fn deliver(cb: &Callbacks, id: u64, ev: Event) -> Option<Hyper4kChunkAction> {
                     },
                 })
                 .collect();
-            (cb.on_headers)(cb.user_data.0, id, status, version, raw.as_ptr(), raw.len());
-            None
+            let action =
+                (cb.on_headers)(cb.user_data.0, id, status, version, raw.as_ptr(), raw.len());
+            // Map the headers action onto the chunk action space so the worker
+            // has one place to react. PAUSE has no meaning at this stage.
+            if action == HYPER4K_HEADERS_CANCEL {
+                Some(HYPER4K_CHUNK_CANCEL)
+            } else {
+                None
+            }
         }
         Event::Chunk(b) => cb
             .on_chunk

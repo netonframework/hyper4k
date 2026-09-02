@@ -10,6 +10,8 @@ pub(crate) mod pool;
 pub(crate) mod tls;
 
 #[cfg(test)]
+mod backpressure_tests;
+#[cfg(test)]
 pub(crate) mod handle_tests;
 #[cfg(test)]
 mod pool_tests;

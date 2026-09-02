@@ -32,6 +32,8 @@ rustls-pemfile = "2"
 # the "expired certificate" case can be produced deliberately.
 rcgen = "0.13"
 time = "0.3"
+tokio-stream = "0.1"
+futures-core = "0.3"
 
 [profile.release]
 opt-level = 3

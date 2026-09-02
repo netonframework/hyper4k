@@ -152,13 +152,12 @@ pub const HYPER4K_CLIENT_CAP_STREAMING: u64 = 1 << 5;
 /// bits in its own commit.
 #[no_mangle]
 pub extern "C" fn hyper4k_client_capabilities() -> u64 {
-    // STREAMING is deliberately absent until Task 6: chunks are delivered, but
-    // backpressure — the half that makes streaming safe — is not implemented.
     HYPER4K_CLIENT_CAP_HTTP1
         | HYPER4K_CLIENT_CAP_HTTP2
         | HYPER4K_CLIENT_CAP_TLS
         | HYPER4K_CLIENT_CAP_CUSTOM_CA
         | HYPER4K_CLIENT_CAP_CANCEL
+        | HYPER4K_CLIENT_CAP_STREAMING
 }
 
 #[cfg(test)]
@@ -219,8 +218,8 @@ mod tests {
         let caps = hyper4k_client_capabilities();
         assert_ne!(caps & HYPER4K_CLIENT_CAP_TLS, 0);
         assert_ne!(caps & HYPER4K_CLIENT_CAP_HTTP2, 0);
-        // Not yet earned: backpressure lands in Task 6.
-        assert_eq!(caps & HYPER4K_CLIENT_CAP_STREAMING, 0);
+        // Earned in Task 6: chunked delivery with real pause/resume backpressure.
+        assert_ne!(caps & HYPER4K_CLIENT_CAP_STREAMING, 0);
     }
 
     #[test]
