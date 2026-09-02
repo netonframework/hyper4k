@@ -6,6 +6,13 @@
 
 **Architecture:** The client lives entirely in Rust on Hyper's stable Rust API plus rustls. Kotlin sees a small, coarse-grained C ABI: create/close/free a client, send/cancel a request, and three callbacks (headers, chunk, done). No rustls, hyper or CryptoProvider type ever crosses the boundary. Per-request bounded queues on a dedicated bridge executor carry events out; backpressure is expressed by the chunk callback's return value, not by queue capacity.
 
+**Connection layer:** `hyper::client::conn::{http1,http2}::handshake` with a pool we
+own — **not** `hyper_util::client::legacy::Client`. Two reasons: the legacy client
+does not expose `try_send_request`, which is the only supported way to learn that a
+request was provably never sent (spec §四); and it retries some cancelled requests on
+its own, which would violate the frozen retry rules. Owning the pool also gives us
+per-connection paused-stream accounting and window sizing at handshake time.
+
 **Tech Stack:** Rust 2021, hyper 1.11, hyper-util 0.1, tokio 1.53, rustls 0.23 with `aws-lc-rs`, tokio-rustls 0.26. Tests use `rcgen` for throwaway CAs and `hyper` client for the peer side.
 
 **Spec:** `docs/ABI_V4_CLIENT_TLS.md` (DESIGN FROZEN, 2026-09-02)
@@ -50,11 +57,118 @@ goes in its own module tree rather than growing that file further.
 - Create `lib/src/client/bridge.rs` — per-request bounded queue, bridge executor,
   pause permit, generation counter.
 - Create `lib/src/client/tls.rs` — rustls config construction, root store, ALPN.
-- Create `lib/src/client/retry.rs` — `response_committed`, GOAWAY classification,
-  retry budget.
+- Create `lib/src/client/retry.rs` — `response_committed`, the provably-unsent
+  signal from `try_send_request`, idempotency and retry budget.
 - Modify `lib/src/lib.rs` — add `mod abi; mod client;`, re-export nothing else.
 - Modify `lib/include/hyper4k.h` — client declarations.
 - Modify `lib/Cargo.toml` — rustls, tokio-rustls, `rcgen` dev-dependency.
+
+---
+
+## Task 0: Spike — what safety signal does hyper actually give us?
+
+**Throwaway.** The output is an answer recorded in the plan, not code we keep.
+Tasks 3 and 6 both depend on it, so it runs first and blocks them.
+
+**Question:** Can `SendRequest::try_send_request` + `TrySendError::take_message`
+carry the whole retry boundary in spec §四, over both h2 and h1, without parsing
+GOAWAY frames?
+
+Source reading already says yes — hyper documents `take_message` as returning the
+request only when it "was never fully sent". But source contracts are not runtime
+behaviour, and the whole retry state machine rests on this one signal.
+
+**Files:** `lib/tests/spike_retry_signal.rs` (deleted at the end of the task)
+
+- [ ] **Step 1: Write the probe**
+
+```rust
+//! Throwaway spike. Delete after recording the findings in the plan.
+//! Run: cargo test --test spike_retry_signal -- --nocapture
+
+#[tokio::test]
+async fn goaway_refused_stream_returns_the_request() {
+    // Server: accept the connection, send SETTINGS, then GOAWAY(last_stream_id=0)
+    // so any stream we open is provably unprocessed.
+    let addr = spawn_h2_goaway_immediately().await;
+    let (mut sender, conn) = h2_handshake(addr).await;
+    tokio::spawn(conn);
+    let err = sender
+        .try_send_request(post_request("/x"))
+        .await
+        .expect_err("peer refuses everything");
+    let mut err = err;
+    assert!(err.take_message().is_some(),
+            "GOAWAY-excluded request must come back for safe replay");
+}
+
+#[tokio::test]
+async fn request_already_on_the_wire_is_not_returned() {
+    // Server reads the full request, then drops the connection without responding.
+    let addr = spawn_h2_read_then_drop().await;
+    let (mut sender, conn) = h2_handshake(addr).await;
+    tokio::spawn(conn);
+    let mut err = sender
+        .try_send_request(post_request("/x"))
+        .await
+        .expect_err("connection died");
+    assert!(err.take_message().is_none(),
+            "a serialized request must NOT look replayable");
+}
+
+#[tokio::test]
+async fn http1_stale_pooled_connection_follows_the_same_rule() {
+    // h1 keep-alive connection closed by the peer between requests.
+    let addr = spawn_h1_close_after_first().await;
+    let (mut sender, conn) = h1_handshake(addr).await;
+    tokio::spawn(conn);
+    let _ = sender.send_request(get_request("/first")).await;
+    let mut err = sender
+        .try_send_request(post_request("/second"))
+        .await
+        .expect_err("peer closed the keep-alive connection");
+    assert!(err.take_message().is_some(),
+            "a request never written to a dead connection must come back");
+}
+
+#[tokio::test]
+async fn headers_received_then_connection_dies_is_not_replayable() {
+    // The committed case: response started, then the peer vanishes.
+    let addr = spawn_h2_headers_then_die().await;
+    let (mut sender, conn) = h2_handshake(addr).await;
+    tokio::spawn(conn);
+    let res = sender.try_send_request(get_request("/x")).await;
+    // Either we get a response whose body then errors, or a send error with no
+    // message. Both must be distinguishable from "never sent".
+    match res {
+        Ok(resp) => {
+            let err = collect_body(resp).await.expect_err("body must fail");
+            eprintln!("committed-then-died surfaced as body error: {err}");
+        }
+        Err(mut e) => assert!(e.take_message().is_none()),
+    }
+}
+```
+
+- [ ] **Step 2: Run it**
+
+Run: `cd lib && cargo test --test spike_retry_signal -- --nocapture`
+Expected: all four pass. If `http1_stale_pooled_connection_follows_the_same_rule`
+fails, h1 needs its own staleness check in the pool and Task 6 grows a branch.
+
+- [ ] **Step 3: Record the findings here**
+
+Write the outcome into this plan under Task 6 as a one-paragraph note: which cases
+yield `Some`, which yield `None`, and whether h1 and h2 agree. If any assumption
+broke, stop and re-plan Task 6 before writing production code.
+
+- [ ] **Step 4: Delete the spike and commit the findings**
+
+```bash
+git rm lib/tests/spike_retry_signal.rs
+git add docs/superpowers/plans/2026-09-02-client-tls-abi.md
+git commit -m "Record what the hyper retry signal guarantees"
+```
 
 ---
 
@@ -303,19 +417,39 @@ mod tests {
 
     #[test]
     fn init_never_writes_past_the_caller_allocation() {
-        // Simulates an old caller (small struct) against a new library.
-        // The guard bytes must survive.
-        #[repr(C)]
-        struct Probe {
-            opts: Hyper4kClientOptions,
-            guard: [u8; 32],
-        }
-        let mut p: Probe = unsafe { std::mem::zeroed() };
-        p.guard = [0xAB; 32];
-        let st = unsafe { hyper4k_client_options_init(&mut p.opts, OPTIONS_MIN_SIZE) };
+        // An old caller allocates ONLY the old prefix. Guard bytes sit
+        // immediately after it, so a library that ignores struct_size and
+        // writes the full modern struct will smash them.
+        //
+        // (The earlier version of this test embedded a full-size struct before
+        // the guard, so a buggy implementation writing the whole struct still
+        // left the guard intact — it could not fail.)
+        const PREFIX: usize = OPTIONS_MIN_SIZE as usize;
+        const GUARD: usize = 64;
+        let mut buf = vec![0xABu8; PREFIX + GUARD];
+        let ptr = buf.as_mut_ptr() as *mut Hyper4kClientOptions;
+
+        let st = unsafe { hyper4k_client_options_init(ptr, OPTIONS_MIN_SIZE) };
         assert_eq!(st, HYPER4K_OK);
-        assert_eq!(p.guard, [0xAB; 32], "init wrote past struct_size");
-        assert_eq!(p.opts.struct_size, OPTIONS_MIN_SIZE);
+        assert!(buf[PREFIX..].iter().all(|&b| b == 0xAB),
+                "init wrote past the caller's struct_size");
+        let written = unsafe { &*ptr };
+        assert_eq!(written.struct_size, OPTIONS_MIN_SIZE);
+        assert_eq!(written.abi_version, hyper4k_abi_version());
+    }
+
+    #[test]
+    fn a_larger_caller_struct_keeps_its_tail_untouched() {
+        // The other direction: a new caller against an older library. Fields the
+        // library does not know about must keep the caller's preset values.
+        let big = size_of::<Hyper4kClientOptions>() + 64;
+        let mut buf = vec![0xCDu8; big];
+        let ptr = buf.as_mut_ptr() as *mut Hyper4kClientOptions;
+        // Ask for more than this build knows: init must clamp to its own size.
+        let st = unsafe { hyper4k_client_options_init(ptr, big as u32) };
+        assert_eq!(st, HYPER4K_OK);
+        assert!(buf[size_of::<Hyper4kClientOptions>()..].iter().all(|&b| b == 0xCD),
+                "init touched fields beyond what this build defines");
     }
 
     #[test]
@@ -660,17 +794,36 @@ Expected: FAIL — `hyper4k_client_new` not found
 
 - [ ] **Step 3: Implement the client**
 
-`Hyper4kClient` owns a `tokio::runtime::Runtime`, a
-`hyper_util::client::legacy::Client` over `HttpConnector`, a `DashMap<u64, RequestHandle>`
-and a bridge executor. `RequestHandle` carries an `AbortHandle`, the generation
-counter and the callback triple. `send` validates the request (`INVALID_ARG` for a
-NULL client/request/out pointer or unparsable URL, `UNSUPPORTED` for
-`http://` + `HTTP2_REQUIRED`), copies method, URL, headers and body into owned
-`Bytes`, registers the handle, then spawns the task — **registration happens before
-the spawn**, so no callback can fire before `send` returns. `close` sets an
-`AtomicBool`, aborts every live handle and lets each task emit its single
-`OnDone(CANCELLED)`. `free` blocks on a `tokio::sync::Notify` until the handle map
-is empty, then drops the runtime.
+`Hyper4kClient` owns a `tokio::runtime::Runtime`, **our own connection pool** over
+`hyper::client::conn::{http1,http2}::handshake` (see the Connection layer note in the
+header — the legacy client is not usable here), a `DashMap<u64, RequestHandle>` and a
+bridge executor.
+
+`send` validates the request (`INVALID_ARG` for a NULL client/request/out pointer or
+unparsable URL, `UNSUPPORTED` for `http://` + `HTTP2_REQUIRED`), copies method, URL,
+headers and body into owned `Bytes`, writes `*out_request_id`, registers the handle,
+then spawns the task.
+
+**The callback-ordering contract is the narrow one, and the code must match it.**
+Writing `*out_request_id` before the spawn does *not* prove "no callback before
+`send` returns" — the spawned task can run on another worker while `send` is still
+unwinding. What is actually guaranteed, and all that is promised:
+
+- `*out_request_id` is written before the request can produce any event.
+- No callback is invoked **re-entrantly on the calling thread** inside `send`.
+- A callback may run on another thread concurrently with `send` returning.
+
+Update spec §2.6's wording to this contract as part of this task; the absolute
+phrasing there ("绝不触发任何回调") overstates what a callee can guarantee.
+
+**Termination goes through one place.** `RequestHandle` holds
+`settle: OnceLock<()>` and a `settle_once(kind: Hyper4kErrorKind)` method that
+atomically claims the right to finish the request, enqueues exactly one `OnDone`,
+and only then aborts the network task. Aborting a tokio task does **not** run its
+ordinary cleanup path, so "abort and let the task emit OnDone" would silently drop
+the callback. `close` walks the map calling `settle_once(CANCELLED)`; `cancel` and
+every error path call the same function. `free` blocks on a `tokio::sync::Notify`
+until the handle map is empty, then drops the runtime.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -680,8 +833,12 @@ Expected: PASS, 6 tests
 - [ ] **Step 5: Turn on the capability bits this task earned**
 
 In `abi.rs`, change `hyper4k_client_capabilities` to return
-`HYPER4K_CLIENT_CAP_HTTP1 | HYPER4K_CLIENT_CAP_CANCEL | HYPER4K_CLIENT_CAP_STREAMING`
-and update `client_capabilities_report_only_shipped_features` to match.
+`HYPER4K_CLIENT_CAP_HTTP1 | HYPER4K_CLIENT_CAP_CANCEL` and update
+`client_capabilities_report_only_shipped_features` to match.
+
+`CAP_STREAMING` is **not** lit here: chunks are delivered, but backpressure — the
+half that makes streaming safe — lands in Task 5. A bit means "implemented and
+tested", not "partially works".
 
 - [ ] **Step 6: Commit**
 
@@ -790,15 +947,17 @@ mod tls_tests {
     }
 
     #[test]
-    fn ca_replace_system_drops_public_roots() {
-        let peer = spawn_tls_server(TlsFixture::valid());
-        let client = new_client_with_ca(peer.ca_pem(),
+    fn ca_replace_system_drops_the_other_roots() {
+        // Two independent local CAs. With REPLACE, only the configured one is
+        // trusted. Deliberately no public host here: unit tests must not depend
+        // on the network — that check lives in Task 7's ignored test.
+        let mine = spawn_tls_server(TlsFixture::valid());
+        let other = spawn_tls_server(TlsFixture::valid());
+        let client = new_client_with_ca(mine.ca_pem(),
                                         HYPER4K_CLIENT_CA_REPLACE_SYSTEM);
-        // Private CA still works...
-        let ok = send_and_wait(client, &format!("https://localhost:{}/x", peer.port));
+        let ok = send_and_wait(client, &format!("https://localhost:{}/x", mine.port));
         assert_eq!(*ok.done.lock().unwrap(), Some(-999));
-        // ...and a public root is no longer trusted.
-        let bad = send_and_wait(client, "https://example.com/");
+        let bad = send_and_wait(client, &format!("https://localhost:{}/x", other.port));
         assert_eq!(*bad.done.lock().unwrap(), Some(HYPER4K_ERR_TLS_CA));
     }
 
@@ -993,7 +1152,12 @@ git commit -m "Express backpressure through the chunk callback"
 **Interfaces:**
 - Consumes: Tasks 3–5.
 - Produces: `pub(crate) struct Attempt { generation: u64, response_committed: AtomicBool }`;
-  `pub(crate) fn may_retry(committed: bool, method_idempotent: bool, goaway: Option<u32>, stream_id: u32) -> bool`.
+  `pub(crate) fn may_retry(committed: bool, provably_unsent: bool, method_idempotent: bool, budget_left: u32) -> bool`.
+
+> The earlier signature took `goaway: Option<u32>` and `stream_id: u32`. Neither has
+> a data source: hyper does not surface GOAWAY frames or stream ids, and Task 0
+> established we do not need them. `provably_unsent` comes from
+> `TrySendError::take_message().is_some()`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1046,8 +1210,12 @@ mod retry_tests {
         let cap = send_get(&peer, "/x");
         wait_until(|| cap.done.lock().unwrap().is_some());
         assert_eq!(*cap.done.lock().unwrap(), Some(HYPER4K_ERR_TRUNCATED));
-        assert_eq!(cap.headers_calls(), 1, "duplicate headers delivered");
-        assert_eq!(peer.request_count(), 1);
+        // Spec §四: the queued headers are discarded, not delivered. Only OnDone
+        // reaches the caller. (An earlier draft asserted 1 here, contradicting
+        // the spec it was implementing.)
+        assert_eq!(cap.headers_calls(), 0,
+                   "queued-but-undelivered headers must be dropped, not flushed");
+        assert_eq!(peer.request_count(), 1, "a committed response was replayed");
     }
 
     #[test]
@@ -1167,15 +1335,54 @@ Run on macOS: `cd lib && cargo test --test public_https -- --ignored`
 Run on Linux: same command in the Linux CI job.
 Expected: PASS on both.
 
-- [ ] **Step 3: Drop mingwX64 from the published matrix**
+- [ ] **Step 3: Add the Kotlin-side width assertion**
+
+Acceptance #43 wants the check on *both* sides; only the Rust half exists so far.
+Add to `src/nativeTest/kotlin/hyper4k/AbiWidthTest.kt` in this repo:
+
+```kotlin
+import kotlinx.cinterop.ExperimentalForeignApi
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+@OptIn(ExperimentalForeignApi::class)
+class AbiWidthTest {
+    @Test
+    fun statusAndActionTypesAreFourBytes() {
+        // cinterop maps `typedef int32_t Hyper4kStatus` to kotlin.Int.
+        // If someone reverts the header to a bare C enum, the mapped width
+        // can change and this fails.
+        assertEquals(4, Int.SIZE_BYTES)
+        assertEquals(hyper4k.HYPER4K_ABI_VERSION.toInt(), (4 shl 16) or 0)
+    }
+}
+```
+
+Run: `./gradlew macosArm64Test`
+
+- [ ] **Step 4: Drop mingwX64 from this repo's matrix**
 
 In `build.gradle.kts` remove `"mingwX64" to "x86_64-pc-windows-gnu"` from
-`rustTriples` and the `mingwX64()` target. In `neton/neton-http-hyper4k/build.gradle.kts`
-remove `mingwX64()` and the two source-set `dependsOn` lines. Remove the
-`x86_64-pc-windows-gnu` line from both READMEs. Claiming a platform nobody builds
-or tests is worse than not claiming it.
+`rustTriples` and the `mingwX64()` target. Remove the `x86_64-pc-windows-gnu` line
+from both READMEs. Claiming a platform nobody builds or tests is worse than not
+claiming it.
 
-- [ ] **Step 4: Verify the four-platform matrix**
+- [ ] **Step 5: Drop mingwX64 from the neton repo — separate commit, separate repo**
+
+`../neton` is a **different git repository**; its files cannot go into a hyper4k
+commit. Do this as its own change and verify it independently:
+
+```bash
+cd ../neton
+# remove mingwX64() and the two mingwX64* dependsOn lines
+$EDITOR neton-http-hyper4k/build.gradle.kts
+./gradlew :neton-http-hyper4k:macosArm64Test
+git add neton-http-hyper4k/build.gradle.kts
+git commit -m "Drop the Windows target from the hyper4k adapter"
+cd ../hyper4k
+```
+
+- [ ] **Step 6: Verify the four-platform matrix**
 
 ```bash
 cd lib
@@ -1188,19 +1395,25 @@ cd .. && ./gradlew macosArm64Test
 
 Expected: four static libraries build; `macosArm64Test` passes.
 
-- [ ] **Step 5: Update the design doc status and commit**
+- [ ] **Step 7: Update the design doc status and commit**
 
 Change the header of `docs/ABI_V4_CLIENT_TLS.md` to
 `DESIGN FROZEN / IMPLEMENTED`, and tick the capability note in §2.1.
 
 ```bash
-git add build.gradle.kts README.md README.zh-Hans.md lib/tests/public_https.rs docs/ABI_V4_CLIENT_TLS.md
+git add build.gradle.kts README.md README.zh-Hans.md \
+        lib/tests/public_https.rs src/nativeTest/kotlin/hyper4k/AbiWidthTest.kt \
+        docs/ABI_V4_CLIENT_TLS.md
 git commit -m "Ship the client on the four supported platforms"
 ```
 
 ---
 
 ## Self-Review
+
+**Task 0 gates Tasks 3 and 6.** If the spike shows h1 and h2 disagree on the
+provably-unsent signal, Task 6 needs a per-protocol branch and must be re-planned
+before any production code is written. Do not skip ahead.
 
 **Spec coverage.** §二 ABI basics → Task 1–2. §三 TLS → Task 4. §四 GOAWAY and
 retry → Task 6. §五 performance (header descriptor array, single body copy, LTO)
