@@ -60,7 +60,7 @@ enum Slot {
     H2(H2Sender),
 }
 
-pub(crate) struct ConnEntry {
+pub struct ConnEntry {
     pub(crate) id: u64,
     slot: Slot,
     active: AtomicU32,
@@ -135,12 +135,12 @@ impl Drop for Lease {
 }
 
 /// Holds one unit of the per-connection paused-stream budget.
-pub(crate) struct PauseGuard {
+pub struct PauseGuard {
     entry: Arc<ConnEntry>,
 }
 
 impl PauseGuard {
-    pub(crate) fn new(entry: Arc<ConnEntry>) -> Self {
+    pub fn new(entry: Arc<ConnEntry>) -> Self {
         entry.paused.fetch_add(1, Ordering::SeqCst);
         PauseGuard { entry }
     }
@@ -316,6 +316,13 @@ impl Pool {
     }
 
     // --- test observability -------------------------------------------------
+
+    pub(crate) fn total_paused(&self) -> u32 {
+        self.conns
+            .iter()
+            .map(|l| l.value().iter().map(|e| e.paused_count()).sum::<u32>())
+            .sum()
+    }
 
     pub(crate) fn connection_count(&self, key: &PoolKey) -> usize {
         self.conns.get(key).map(|l| l.len()).unwrap_or(0)

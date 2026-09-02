@@ -68,6 +68,11 @@ pub(crate) struct RequestState {
     permit: AtomicBool,
     parked: StdMutex<bool>,
     unpark: Condvar,
+    /// The connection this request is riding on, once one is acquired. Parking
+    /// takes a slot of that connection's paused-stream budget so the pool can
+    /// keep the reservation invariant in spec §2.5 — without this the invariant
+    /// would be decoration.
+    conn: StdMutex<Option<Arc<super::pool::ConnEntry>>>,
 }
 
 impl RequestState {
@@ -81,7 +86,12 @@ impl RequestState {
             permit: AtomicBool::new(false),
             parked: StdMutex::new(false),
             unpark: Condvar::new(),
+            conn: StdMutex::new(None),
         }
+    }
+
+    pub(crate) fn bind_connection(&self, entry: Arc<super::pool::ConnEntry>) {
+        *self.conn.lock().unwrap() = Some(entry);
     }
 
     pub(crate) fn mark_committed(&self) {
@@ -154,6 +164,14 @@ impl RequestState {
         if self.permit.swap(false, Ordering::SeqCst) {
             return true;
         }
+        // Held for exactly as long as this stream is parked.
+        let _budget = self
+            .conn
+            .lock()
+            .unwrap()
+            .clone()
+            .map(super::pool::PauseGuard::new);
+
         let mut parked = self.parked.lock().unwrap();
         *parked = true;
         while *parked && !self.discarding() {

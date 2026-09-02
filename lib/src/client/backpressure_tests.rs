@@ -378,3 +378,37 @@ fn repeated_pause_and_resume_does_not_deadlock() {
     assert_eq!(ctl.chunk_count(), 3);
     unsafe { hyper4k_client_free(client) };
 }
+
+#[test]
+fn a_paused_request_consumes_its_connection_paused_budget() {
+    // Without this the reservation invariant in spec §2.5 is decoration: the
+    // pool would keep handing new streams to a connection whose streams are all
+    // parked, and the connection-level window would starve the live ones.
+    // clippy caught the gap first — PauseGuard was never constructed outside
+    // the pool's own tests.
+    let r = rt();
+    let addr = r.block_on(chunked_server(PARTS));
+    let ctl = Arc::new(Ctl::default());
+    *ctl.plan.lock().unwrap() = vec![Plan::Pause];
+    let client = new_client();
+    let url = format!("http://{addr}/x");
+    let id = start(client, &url, &ctl);
+
+    wait_until("paused", || ctl.chunk_count() >= 1);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        unsafe { hyper4k_client_paused_stream_count(client) },
+        1,
+        "a parked stream did not take a slot of its connection's budget"
+    );
+
+    assert_eq!(
+        unsafe { hyper4k_client_resume(client, id) },
+        HYPER4K_STATUS_OK
+    );
+    wait_until("all chunks", || ctl.chunk_count() == 3);
+    wait_until("budget returned", || unsafe {
+        hyper4k_client_paused_stream_count(client) == 0
+    });
+    unsafe { hyper4k_client_free(client) };
+}

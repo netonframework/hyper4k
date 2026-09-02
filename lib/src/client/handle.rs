@@ -373,6 +373,26 @@ pub unsafe extern "C" fn hyper4k_client_resume(
     h.state.resume()
 }
 
+/// Total parked streams across every pooled connection.
+///
+/// Diagnostics only — it exists so the reservation invariant can be observed
+/// rather than assumed.
+///
+/// # Safety
+/// `client` must be a live client.
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_client_paused_stream_count(client: *mut Hyper4kClient) -> u32 {
+    if client.is_null() {
+        return 0;
+    }
+    let c = &*client;
+    let mut n = c.pool.total_paused();
+    if let Some(p) = c.tls_pool.as_ref() {
+        n += p.total_paused();
+    }
+    n
+}
+
 /// Cancel a request. Idempotent, callback-thread safe, non-blocking.
 ///
 /// # Safety
@@ -495,6 +515,10 @@ async fn attempt_loop(
             );
             return;
         }
+
+        // Tie the request to this connection so a pause consumes that
+        // connection's paused-stream budget rather than an abstract one.
+        handle.state.bind_connection(lease.entry.clone());
 
         // Every attempt builds a fresh request: try_send_request consumes it,
         // and on the not-provably-unsent path it is not handed back at all.
