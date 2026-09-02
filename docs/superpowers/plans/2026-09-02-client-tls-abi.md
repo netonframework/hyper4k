@@ -1604,6 +1604,13 @@ and are dropped if it no longer matches.
 `provably_unsent` is `TrySendError::take_message().is_some()`. Idempotent methods
 are GET, HEAD, PUT, DELETE, OPTIONS, TRACE.
 
+**A retry rebuilds the request; it never reuses the old one.** `hyper::Request` is
+consumed by `try_send_request`, and on the `take_message() == None` path it is not
+handed back at all, so there is nothing left to resend. Each request therefore keeps
+an immutable `RequestTemplate { method: Method, uri: Uri, headers: HeaderMap, body: Bytes }`
+captured at `send`, and every attempt constructs a fresh `Request<Full<Bytes>>` from
+it. `Bytes` clones are a refcount bump, so retrying costs no body copy.
+
 Retries reuse the same `request_id`. The overall deadline is computed once at
 `send` and shared across attempts; the idle deadline is rearmed on every delivered
 chunk.
@@ -1646,6 +1653,17 @@ fn system_roots_validate_a_public_host() {
     let cap = send_and_wait(client, "https://example.com/");
     assert_eq!(*cap.done.lock().unwrap(), Some(-999));
     assert_eq!(cap.status.load(Ordering::SeqCst) & 0xFFFF, 200);
+}
+
+#[test]
+#[ignore]
+fn a_custom_ca_without_replace_keeps_the_system_roots() {
+    // The unit test for "append" only proves the private CA works. It cannot
+    // prove the system roots survived, because it has no publicly-signed peer.
+    let client = new_client_with_ca(throwaway_ca_pem(), 0 /* no REPLACE */);
+    let cap = send_and_wait(client, "https://example.com/");
+    assert_eq!(*cap.done.lock().unwrap(), Some(-999),
+               "adding a custom CA silently replaced the system trust store");
 }
 ```
 
