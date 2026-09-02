@@ -465,14 +465,21 @@ mod tests {
     fn a_larger_caller_struct_keeps_its_tail_untouched() {
         // The other direction: a new caller against an older library. Fields the
         // library does not know about must keep the caller's preset values.
-        let big = size_of::<Hyper4kClientOptions>() + 64;
-        let mut buf = vec![0xCDu8; big];
-        let ptr = buf.as_mut_ptr() as *mut Hyper4kClientOptions;
+        // Same alignment discipline as the test above.
+        let known = size_of::<Hyper4kClientOptions>();
+        let big = known + 64;
+        let layout = std::alloc::Layout::from_size_align(
+            big, std::mem::align_of::<Hyper4kClientOptions>()).unwrap();
+        let base = unsafe { std::alloc::alloc(layout) };
+        assert!(!base.is_null());
+        unsafe { std::ptr::write_bytes(base, 0xCD, big) };
         // Ask for more than this build knows: init must clamp to its own size.
-        let st = unsafe { hyper4k_client_options_init(ptr, big as u32) };
+        let st = unsafe { hyper4k_client_options_init(base as *mut _, big as u32) };
         assert_eq!(st, HYPER4K_OK);
-        assert!(buf[size_of::<Hyper4kClientOptions>()..].iter().all(|&b| b == 0xCD),
+        let tail = unsafe { std::slice::from_raw_parts(base.add(known), big - known) };
+        assert!(tail.iter().all(|&b| b == 0xCD),
                 "init touched fields beyond what this build defines");
+        unsafe { std::alloc::dealloc(base, layout) };
     }
 
     #[test]
@@ -614,7 +621,7 @@ git commit -m "Add version-safe client options and request initialisers"
 
 ---
 
-## Task 3: Connection pool
+## Task 3: Connection pool (plaintext core)
 
 **Files:**
 - Create: `lib/src/client/pool.rs`
@@ -623,16 +630,28 @@ git commit -m "Add version-safe client options and request initialisers"
 Switching off `legacy::Client` makes the pool the load-bearing component, so it
 gets its own task, file and tests rather than one line inside the lifecycle task.
 
+**Plaintext only in this task.** The real `ClientConfig` builder does not exist
+until Task 5, so ALPN-driven sender selection and trust-based pool partitioning are
+tested there, against the real thing. Verifying ALPN against a stub would prove
+nothing about ALPN.
+
 **Interfaces:**
 - Consumes: `Hyper4kStatus` (Task 1), TLS config builder (Task 4 provides the real
   one; this task takes a `Fn() -> ClientConfig` so it can be tested with a stub).
 - Produces:
-  `pub(crate) struct PoolKey { scheme: Scheme, host: String, port: u16, tls_fingerprint: u64 }`;
+  `pub(crate) struct PoolKey { scheme: Scheme, host: String, port: u16 }`;
   `pub(crate) enum Sender { H1(http1::SendRequest<Full<Bytes>>), H2(http2::SendRequest<Full<Bytes>>) }`;
   `pub(crate) struct Pool` with
-  `async fn acquire(&self, key: &PoolKey) -> Result<Lease, Hyper4kErrorKind>`,
-  `fn release(&self, lease: Lease)`, `async fn shutdown(&self)`;
-  `pub(crate) struct Lease { sender: Sender, conn_id: u64 }`.
+  `async fn acquire(&self, key: &PoolKey) -> Result<Lease, Hyper4kErrorKind>`
+  and `async fn shutdown(&self)`;
+  `pub(crate) struct Lease { sender: Sender, conn_id: u64, entry: Arc<ConnEntry> }`
+  whose `Drop` returns the capacity;
+  `pub(crate) struct PauseGuard { entry: Arc<ConnEntry> }`, likewise `Drop`-based.
+
+> The key has **no TLS fingerprint**. The pool belongs to one client, and one
+> client has exactly one trust configuration, so nothing to partition. (A global
+> pool would need real partitioning, and a 64-bit hash would not be a sound
+> isolation boundary anyway.)
 
 Frozen model:
 
@@ -646,9 +665,16 @@ Frozen model:
 - **Each connection owns a driver task.** The pool holds its `JoinHandle`; the
   driver ends when the connection closes or `shutdown()` aborts it. `shutdown()`
   must join every driver, otherwise `hyper4k_client_free` can hang.
-- **Eviction:** a lease is discarded on release if `is_closed()`, and an h2
-  connection stops accepting new streams once its paused-stream count reaches the
-  window-reservation cap from spec §2.5.
+- **Capacity accounting is RAII, never manual.** `ConnEntry` holds
+  `active: AtomicU32` and `paused: AtomicU32`. `Lease::drop` releases the h1
+  exclusive slot or decrements `active`; `PauseGuard::drop` decrements `paused`
+  exactly once. There is no public `release()` or `unmark_paused()` — a cancel,
+  timeout, connection error, retry switch or panic all unwind through `Drop`, so
+  no path can leak capacity. A pool that leaks capacity eventually believes every
+  connection is full and dials forever.
+- **Eviction:** a lease is discarded on drop if `is_closed()`, and an h2 connection
+  stops accepting new streams once `paused` reaches the window-reservation cap from
+  spec §2.5. Connection selection checks **both** `active` and `paused`.
 - **Dial de-duplication:** concurrent `acquire` calls for the same key await one
   in-flight dial via a `DashMap<PoolKey, Shared<...>>`, so a burst of requests to
   one authority opens one connection, not N.
@@ -663,7 +689,7 @@ mod pool_tests {
     #[tokio::test]
     async fn h2_requests_to_one_authority_share_a_connection() {
         let peer = spawn_h2_server().await;
-        let pool = Pool::new(stub_tls());
+        let pool = Pool::new(plaintext_only());
         let key = key_for(&peer);
         let a = pool.acquire(&key).await.unwrap();
         let b = pool.acquire(&key).await.unwrap();
@@ -671,9 +697,9 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn h1_requests_do_not_share_a_connection() {
+    async fn h1_connections_are_exclusive_while_held() {
         let peer = spawn_h1_server().await;
-        let pool = Pool::new(stub_tls());
+        let pool = Pool::new(plaintext_only());
         let key = key_for(&peer);
         let a = pool.acquire(&key).await.unwrap();
         let b = pool.acquire(&key).await.unwrap();
@@ -681,9 +707,22 @@ mod pool_tests {
     }
 
     #[tokio::test]
+    async fn h1_connections_are_reused_after_release() {
+        // Without this, "pool" would just mean "dial every time" for h1.
+        let peer = spawn_h1_server().await;
+        let pool = Pool::new(plaintext_only());
+        let key = key_for(&peer);
+        let a = pool.acquire(&key).await.unwrap();
+        let id = a.conn_id;
+        drop(a);                              // RAII returns the exclusive slot
+        let b = pool.acquire(&key).await.unwrap();
+        assert_eq!(b.conn_id, id, "released h1 connection was not reused");
+    }
+
+    #[tokio::test]
     async fn concurrent_acquires_dial_once() {
         let peer = spawn_h2_server_counting_accepts().await;
-        let pool = Pool::new(stub_tls());
+        let pool = Pool::new(plaintext_only());
         let key = key_for(&peer);
         let leases = futures::future::join_all(
             (0..16).map(|_| pool.acquire(&key))
@@ -693,18 +732,9 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn different_tls_policy_does_not_share_a_connection() {
-        let peer = spawn_h2_server().await;
-        let pool = Pool::new(stub_tls());
-        let a = pool.acquire(&key_with_fingerprint(&peer, 1)).await.unwrap();
-        let b = pool.acquire(&key_with_fingerprint(&peer, 2)).await.unwrap();
-        assert_ne!(a.conn_id, b.conn_id, "trust config must partition the pool");
-    }
-
-    #[tokio::test]
     async fn a_closed_connection_is_evicted_on_release() {
         let peer = spawn_h2_server().await;
-        let pool = Pool::new(stub_tls());
+        let pool = Pool::new(plaintext_only());
         let key = key_for(&peer);
         let lease = pool.acquire(&key).await.unwrap();
         peer.drop_all_connections();
@@ -716,20 +746,9 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn alpn_result_selects_the_sender_variant() {
-        let h2_peer = spawn_tls_server_alpn(&["h2"]).await;
-        let h1_peer = spawn_tls_server_alpn(&["http/1.1"]).await;
-        let pool = Pool::new(real_tls());
-        assert!(matches!(pool.acquire(&key_for(&h2_peer)).await.unwrap().sender,
-                         Sender::H2(_)));
-        assert!(matches!(pool.acquire(&key_for(&h1_peer)).await.unwrap().sender,
-                         Sender::H1(_)));
-    }
-
-    #[tokio::test]
     async fn shutdown_joins_every_connection_driver() {
         let peer = spawn_h2_server().await;
-        let pool = Pool::new(stub_tls());
+        let pool = Pool::new(plaintext_only());
         let _lease = pool.acquire(&key_for(&peer)).await.unwrap();
         // If a driver task outlives shutdown, hyper4k_client_free would hang.
         tokio::time::timeout(Duration::from_secs(5), pool.shutdown())
@@ -740,14 +759,44 @@ mod pool_tests {
     #[tokio::test]
     async fn an_h2_connection_at_the_paused_cap_stops_taking_new_streams() {
         let peer = spawn_h2_server().await;
-        let pool = Pool::new(stub_tls()).with_paused_cap(2);
+        let pool = Pool::new(plaintext_only()).with_paused_cap(2);
         let key = key_for(&peer);
         let a = pool.acquire(&key).await.unwrap();
-        pool.mark_paused(a.conn_id);
-        pool.mark_paused(a.conn_id);
+        let _g1 = PauseGuard::new(a.entry.clone());
+        let _g2 = PauseGuard::new(a.entry.clone());
         let c = pool.acquire(&key).await.unwrap();
         assert_ne!(c.conn_id, a.conn_id,
                    "new stream landed on a connection at its paused cap");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pause_guard_restores_capacity() {
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(plaintext_only()).with_paused_cap(1);
+        let key = key_for(&peer);
+        let a = pool.acquire(&key).await.unwrap();
+        {
+            let _g = PauseGuard::new(a.entry.clone());
+            let other = pool.acquire(&key).await.unwrap();
+            assert_ne!(other.conn_id, a.conn_id);
+        }
+        let back = pool.acquire(&key).await.unwrap();
+        assert_eq!(back.conn_id, a.conn_id, "paused count leaked after drop");
+    }
+
+    #[tokio::test]
+    async fn capacity_survives_cancel_timeout_and_connection_error() {
+        // Every abnormal exit unwinds through Drop; none may leak a slot.
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(plaintext_only());
+        let key = key_for(&peer);
+        let before = pool.active_count(&key);
+        for scenario in [Abort::Cancel, Abort::Timeout, Abort::ConnError] {
+            let lease = pool.acquire(&key).await.unwrap();
+            simulate_abort(scenario, lease).await;   // consumes the lease
+        }
+        assert_eq!(pool.active_count(&key), before,
+                   "an abnormal exit leaked pool capacity");
     }
 }
 ```
@@ -768,7 +817,7 @@ the negotiated ALPN protocol, spawns the connection driver and stores its
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd lib && cargo test --lib client::pool_tests`
-Expected: PASS, 8 tests
+Expected: PASS, 9 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1010,18 +1059,39 @@ the task emit OnDone" would silently drop the callback. But enqueueing `OnDone` 
 *then* aborting also leaves a window: between those two points the network task can
 still push headers or a chunk, and the caller sees a callback after `OnDone`.
 
-`settle_once(kind)` therefore runs in this order, and the order is the contract:
+**There are two termination modes, and conflating them loses good data.** A normal
+success also goes through `settle_once`, and by then headers and chunks are already
+sitting in the bridge queue waiting to be delivered. Discarding them unconditionally
+would leave the caller with nothing but `OnDone(NULL)` — a silently empty response.
+
+```rust
+enum Settle {
+    /// Normal completion: deliver what is already queued, then Done.
+    DrainThenDone,
+    /// Cancel / close / TRUNCATED: the queued events are stale, drop them.
+    DiscardThenDone(Hyper4kErrorKind),
+}
+```
+
+The control side keeps its **own `done_tx`**, separate from the event producer, so
+that step 3 below can close the producer and step 5 can still enqueue `Done`.
+
+`settle_once(mode)` runs in this order, and the order is the contract:
 
 1. **Atomically flip the request state to `TERMINAL`** (`compare_exchange` on an
    `AtomicU8`). Losing the race means someone else is settling; return immediately.
-2. **The bridge drops every non-`Done` event for this request from now on** — both
-   already-queued ones and any that arrive later. This is what discards the
-   queued-but-undelivered headers in spec §四.
-3. Close the event producer side of the request's queue.
-4. Enqueue `OnDone` as the **last** event on that queue.
-5. Abort the network task.
-6. Remove the handle from the map **only after `OnDone` has returned**, so
+2. Stop the network task from producing **new** events.
+3. Close the event producer half of the request's queue.
+4. **`DiscardThenDone` only:** drain and drop every queued non-`Done` event. This is
+   what discards the queued-but-undelivered headers in spec §四.
+   **`DrainThenDone` keeps them** — they are the response.
+5. Enqueue `OnDone` through `done_tx` as the **last** event on that queue.
+6. Abort the network task.
+7. Remove the handle from the map **only after `OnDone` has returned**, so
    `user_data` stays alive for the whole callback.
+
+`close`, `cancel` and every error path use `DiscardThenDone`; only the normal
+end-of-body path uses `DrainThenDone`.
 
 `close` walks the map calling `settle_once(CANCELLED)`; `cancel` and every error
 path call the same function. `free` blocks on a `tokio::sync::Notify` until the
@@ -1163,6 +1233,20 @@ mod tls_tests {
         assert_eq!(*bad.done.lock().unwrap(), Some(HYPER4K_ERR_TLS_CA));
     }
 
+    #[tokio::test]
+    async fn alpn_result_selects_the_sender_variant() {
+        // Moved here from the pool task: this needs the real ClientConfig, which
+        // only exists from this task onwards. Asserting ALPN against a stub would
+        // have proved nothing about ALPN.
+        let h2_peer = spawn_tls_server_alpn(&["h2"]).await;
+        let h1_peer = spawn_tls_server_alpn(&["http/1.1"]).await;
+        let pool = Pool::new(tls_from(build_tls_config(None, false, false).unwrap()));
+        assert!(matches!(pool.acquire(&key_for(&h2_peer)).await.unwrap().sender,
+                         Sender::H2(_)));
+        assert!(matches!(pool.acquire(&key_for(&h1_peer)).await.unwrap().sender,
+                         Sender::H1(_)));
+    }
+
     #[test]
     fn unknown_flag_bits_are_rejected() {
         let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
@@ -1194,7 +1278,7 @@ Wire the connector into the client built in Task 3.
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `cd lib && cargo test --lib client::tls_tests`
-Expected: PASS, 9 tests
+Expected: PASS, 10 tests
 
 - [ ] **Step 6: Turn on the earned capability bits and commit**
 
@@ -1651,16 +1735,18 @@ git commit -m "Ship the client on the four supported platforms"
 provably-unsent signal, Task 7 needs a per-protocol branch and must be re-planned
 before any production code is written. Do not skip ahead.
 
-**Spec coverage.** §二 ABI basics → Task 1–2. §三 TLS → Task 4. §四 GOAWAY and
-retry → Task 6. §五 performance (header descriptor array, single body copy, LTO)
-→ structural, enforced by Task 3's `Hyper4kHeader` signature and the existing
-release profile; the three-layer benchmark baseline is **not** in this plan — it is
-follow-on work once the client runs, and is called out here rather than silently
-dropped. §六 platform matrix → Task 7. §七 acceptance 1–43 map as: 1–5 → Task 4;
-6, 16–17, 23–25, 27, 35–37, 41 → Task 5; 7, 18–19 → Task 6; 8, 26 → Task 3;
-9 → Task 5; 10 → Task 3; 11 → Task 4; 12 → Task 3; 13 → Task 3; 14 → Task 4;
-15, 29–30, 34, 39 → Task 2; 20 → Task 3; 21–22 → Task 7; 28 → Task 6;
-31 → Task 6; 32 → Task 3; 33 → Task 5; 38, 40, 42–43 → Task 1–2.
+**Spec coverage.** §二 ABI basics → Tasks 1–2. §2.3 lifecycle → Task 4.
+§2.5 backpressure and the resource caps → Tasks 3 and 6. §三 TLS → Task 5.
+§四 retry → Tasks 0 and 7. §五 performance (header descriptor array, single body
+copy, LTO) → structural, enforced by Task 4's `Hyper4kHeader` signature and the
+existing release profile; the three-layer benchmark baseline is **not** in this
+plan — it is follow-on work once the client runs, and is called out here rather
+than silently dropped. §六 platform matrix → Task 8.
+
+Acceptance items map as: 1–5, 11, 14 → Task 5; 6, 9, 16–17, 23–25, 27, 33, 35–37,
+41 → Task 6; 7, 18–19, 28, 31 → Task 7; 8, 10, 12–13, 20, 26, 32 → Task 4;
+15, 29–30, 34, 39 → Task 2; 21 → Task 8; 22 → Task 8; 38, 40, 43 → Tasks 1–2 plus
+Task 8's Kotlin and C static assertions; 42 → Task 2.
 
 **Placeholders.** None: every step names exact files, exact commands and the
 expected pass/fail string.
