@@ -6,8 +6,9 @@ use super::bridge::{
 use super::plaintext::PlaintextConnector;
 use super::pool::{Pool, PoolKey, Sender};
 use super::{
-    validate_header, Hyper4kClientOptions, Hyper4kClientRequest, HYPER4K_CLIENT_CA_REPLACE_SYSTEM,
-    HYPER4K_CLIENT_HTTP2_REQUIRED, KNOWN_CLIENT_FLAGS, OPTIONS_MIN_SIZE, REQUEST_MIN_SIZE,
+    copy_prefix, defaults_options, defaults_request, validate_header, Hyper4kClientOptions,
+    Hyper4kClientRequest, HYPER4K_CLIENT_CA_REPLACE_SYSTEM, HYPER4K_CLIENT_HTTP2_REQUIRED,
+    KNOWN_CLIENT_FLAGS, OPTIONS_MIN_SIZE, REQUEST_MIN_SIZE,
 };
 use crate::abi::*;
 use bytes::Bytes;
@@ -51,7 +52,25 @@ pub(crate) struct RequestTemplate {
 }
 
 impl RequestTemplate {
-    pub(crate) fn build(&self) -> hyper::Request<Full<Bytes>> {
+    /// Rejects anything the builder would later refuse.
+    ///
+    /// Validation has to happen at submit time, not at build time: the crate is
+    /// compiled with `panic = "abort"`, so a builder `expect` on an illegal
+    /// header name would take the host process down instead of returning
+    /// INVALID_ARG. A caller must never be able to kill us with a bad header.
+    pub(crate) fn validate(&self) -> bool {
+        for (n, v) in &self.headers {
+            if hyper::header::HeaderName::from_bytes(n).is_err() {
+                return false;
+            }
+            if hyper::header::HeaderValue::from_bytes(v).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn build(&self) -> Option<hyper::Request<Full<Bytes>>> {
         let mut b = hyper::Request::builder()
             .method(self.method.clone())
             .uri(self.uri.clone());
@@ -65,8 +84,7 @@ impl RequestTemplate {
         if !saw_host {
             b = b.header("host", self.authority.as_str());
         }
-        b.body(Full::new(self.body.clone()))
-            .expect("validated at send")
+        b.body(Full::new(self.body.clone())).ok()
     }
 }
 
@@ -94,11 +112,17 @@ pub unsafe extern "C" fn hyper4k_client_new(
     if opts.is_null() || out_client.is_null() {
         return HYPER4K_STATUS_INVALID_ARG;
     }
-    let o = &*opts;
-    let st = validate_header(o.abi_version, o.struct_size, OPTIONS_MIN_SIZE);
+    // Read only the prefix the caller allocated. Dereferencing their shorter
+    // buffer as a full struct would read past the end of their allocation —
+    // exactly the bug the init functions are careful to avoid on the write side.
+    let raw_size =
+        std::ptr::read_unaligned((opts as *const u8).add(std::mem::size_of::<u32>()) as *const u32);
+    let raw_abi = std::ptr::read_unaligned(opts as *const u32);
+    let st = validate_header(raw_abi, raw_size, OPTIONS_MIN_SIZE);
     if st != HYPER4K_STATUS_OK {
         return st;
     }
+    let o = &copy_prefix::<Hyper4kClientOptions>(opts as *const u8, raw_size, defaults_options());
     // An unknown flag is refused, never ignored: the bit we drop could be the
     // one carrying a security decision.
     if o.flags & !KNOWN_CLIENT_FLAGS != 0 {
@@ -129,9 +153,13 @@ pub unsafe extern "C" fn hyper4k_client_new(
     };
     // Built eagerly: a bad CA bundle should fail at construction, not on the
     // first request where it looks like a network problem.
+    // A bad CA bundle fails here, loudly. Turning it into `None` and reporting
+    // success would defer the error to the first HTTPS request, where it reads
+    // as a network problem instead of a configuration one.
     let tls_pool = match super::tls::TlsClientConnector::new(&tls_opts) {
         Ok(c) => Some(Arc::new(Pool::new(Arc::new(c)))),
-        Err(_) => None,
+        Err(HYPER4K_ERR_TLS_CA) => return HYPER4K_STATUS_INVALID_ARG,
+        Err(_) => None, // no platform trust store: plaintext still works
     };
 
     let client = Hyper4kClient {
@@ -235,11 +263,16 @@ pub unsafe extern "C" fn hyper4k_client_send(
         return HYPER4K_STATUS_INVALID_ARG;
     }
     let c = &*client;
-    let r = &*request;
-    let st = validate_header(r.abi_version, r.struct_size, REQUEST_MIN_SIZE);
+    let raw_size = std::ptr::read_unaligned(
+        (request as *const u8).add(std::mem::size_of::<u32>()) as *const u32
+    );
+    let raw_abi = std::ptr::read_unaligned(request as *const u32);
+    let st = validate_header(raw_abi, raw_size, REQUEST_MIN_SIZE);
     if st != HYPER4K_STATUS_OK {
         return st;
     }
+    let r =
+        &copy_prefix::<Hyper4kClientRequest>(request as *const u8, raw_size, defaults_request());
     if c.closed.load(Ordering::SeqCst) {
         return HYPER4K_STATUS_CLIENT_CLOSED;
     }
@@ -294,6 +327,18 @@ pub unsafe extern "C" fn hyper4k_client_send(
         Bytes::copy_from_slice(std::slice::from_raw_parts(r.body_ptr, r.body_len))
     };
 
+    // Decide the transport BEFORE anything is registered. Creating the bridge
+    // first and refusing afterwards would leave a registered request that no
+    // one will ever settle.
+    let pool = if scheme == "https" {
+        match c.tls_pool.clone() {
+            Some(p) => p,
+            None => return HYPER4K_STATUS_UNSUPPORTED,
+        }
+    } else {
+        c.pool.clone()
+    };
+
     let template = RequestTemplate {
         method,
         uri,
@@ -301,6 +346,9 @@ pub unsafe extern "C" fn hyper4k_client_send(
         body,
         authority: format!("{host}:{port}"),
     };
+    if !template.validate() {
+        return HYPER4K_STATUS_INVALID_ARG;
+    }
     let key = PoolKey::new(&scheme, &host, port);
     let id = c.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -327,14 +375,6 @@ pub unsafe extern "C" fn hyper4k_client_send(
     // Written before anything can fire, per contract point 1.
     *out_request_id = id;
 
-    let pool = if scheme == "https" {
-        match c.tls_pool.clone() {
-            Some(p) => p,
-            None => return HYPER4K_STATUS_UNSUPPORTED,
-        }
-    } else {
-        c.pool.clone()
-    };
     let h = handle.clone();
     // UINT64_MAX inherits, 0 disables, anything else overrides.
     let idle = match r.read_idle_timeout_ms {
@@ -522,7 +562,17 @@ async fn attempt_loop(
 
         // Every attempt builds a fresh request: try_send_request consumes it,
         // and on the not-provably-unsent path it is not handed back at all.
-        let req = template.build();
+        let Some(req) = template.build() else {
+            handle.settle(
+                Terminal {
+                    kind: HYPER4K_ERR_PROTOCOL,
+                    protocol_code: 0,
+                    message: "request could not be built".into(),
+                },
+                true,
+            );
+            return;
+        };
         type Sent = Result<
             hyper::Response<hyper::body::Incoming>,
             hyper::client::conn::TrySendError<hyper::Request<Full<Bytes>>>,

@@ -103,15 +103,147 @@ uint64_t    hyper4k_client_capabilities(void);
 #define HYPER4K_CLIENT_CAP_CANCEL    (1ull << 4)
 #define HYPER4K_CLIENT_CAP_STREAMING (1ull << 5)
 
-/* 不透明句柄 */
-typedef struct Hyper4kServer Hyper4kServer;
-typedef uint64_t Hyper4kResponder;
 
 /* 借用的字节切片（ptr 可能为 NULL 当 len == 0） */
 typedef struct Hyper4kSlice {
     const uint8_t *ptr;
     size_t len;
 } Hyper4kSlice;
+
+/* ---------------------------------------------------------------------------
+ * ABI v4: outbound client
+ *
+ * Lifecycle:
+ *   new -> send* -> close -> free
+ *
+ * Threading:
+ *   send / cancel / resume / close may be called from ANY thread, including a
+ *   callback thread. All four are re-entrant and non-blocking.
+ *   free requires exclusive ownership and MUST NOT be called from a callback
+ *   thread: it waits for the very bridge that is running the callback.
+ *   free(NULL) and double free are NOT safe; the wrapper must call it once.
+ *
+ * Callbacks:
+ *   Ordering per request_id: OnHeaders -> OnChunk* -> OnDone, strictly serial.
+ *   Different request_ids may run concurrently, so the implementations must be
+ *   thread safe. OnDone fires exactly once per accepted request and nothing
+ *   follows it. Slices are borrowed for the duration of the call only.
+ *   An exception must never cross this boundary: the crate is panic = "abort".
+ *   Return CANCEL to abandon a request from inside a callback instead.
+ * ------------------------------------------------------------------------- */
+
+typedef struct Hyper4kClient Hyper4kClient;
+
+typedef struct {
+    Hyper4kSlice name;
+    Hyper4kSlice value;
+} Hyper4kHeader;
+
+typedef struct {
+    Hyper4kErrorKind kind;          /* stable category */
+    uint32_t         protocol_code; /* e.g. an HTTP/2 error code, else 0       */
+    Hyper4kSlice     message;       /* borrowed; for logs only, never branch   */
+} Hyper4kError;
+
+/* client flags */
+#define HYPER4K_CLIENT_HTTP2_REQUIRED    (1ull << 0)  /* fail, never downgrade  */
+#define HYPER4K_CLIENT_CA_REPLACE_SYSTEM (1ull << 1)  /* default is "append"    */
+
+typedef struct {
+    uint32_t       abi_version;
+    uint32_t       struct_size;
+    uint64_t       flags;
+    uint64_t       connect_timeout_ms;    /* 0 disables                        */
+    uint64_t       request_timeout_ms;    /* 0 disables; covers all retries    */
+    uint64_t       read_idle_timeout_ms;  /* 0 disables; re-armed per chunk    */
+    uint32_t       max_retries;           /* ADDITIONAL attempts; 0 = try once */
+    uint32_t       reserved;
+    const uint8_t *custom_ca_pem;         /* NULL = platform roots only        */
+    size_t         custom_ca_pem_len;
+} Hyper4kClientOptions;
+
+typedef struct {
+    uint32_t             abi_version;
+    uint32_t             struct_size;
+    Hyper4kSlice         method;
+    Hyper4kSlice         url;
+    const Hyper4kHeader *headers;
+    size_t               header_count;
+    const uint8_t       *body_ptr;
+    size_t               body_len;
+    /* UINT64_MAX inherits the client default, 0 disables, else overrides.
+       Inherit is NOT 0: a zeroed struct would silently disable the timeout. */
+    uint64_t             read_idle_timeout_ms;
+} Hyper4kClientRequest;
+
+/*
+ * Fill with this build's defaults. Pass the size YOU allocated: an older caller
+ * loading a newer library would otherwise be written past the end of its own
+ * buffer. Only min(struct_size, our size) bytes are touched.
+ */
+Hyper4kStatus hyper4k_client_options_init(Hyper4kClientOptions *opts,
+                                          uint32_t struct_size);
+Hyper4kStatus hyper4k_client_request_init(Hyper4kClientRequest *request,
+                                          uint32_t struct_size);
+
+/* headers/chunk actions are returned by the callbacks; see the constants above. */
+typedef Hyper4kHeadersAction (*Hyper4kOnHeaders)(void *user_data,
+                                                 uint64_t request_id,
+                                                 uint16_t status,
+                                                 uint8_t version, /* 1 or 2 */
+                                                 const Hyper4kHeader *headers,
+                                                 size_t header_count);
+
+typedef Hyper4kChunkAction (*Hyper4kOnChunk)(void *user_data,
+                                             uint64_t request_id,
+                                             const uint8_t *ptr,
+                                             size_t len);
+
+/* error == NULL means success. HTTP 4xx/5xx are successes, not errors. */
+typedef void (*Hyper4kOnDone)(void *user_data,
+                              uint64_t request_id,
+                              const Hyper4kError *error);
+
+Hyper4kStatus hyper4k_client_new(const Hyper4kClientOptions *opts,
+                                 Hyper4kClient **out_client);
+
+/* Idempotent, non-blocking. Every accepted request still gets one OnDone. */
+void hyper4k_client_close(Hyper4kClient *client);
+
+/* Blocks until nothing can call back any more, then frees. */
+void hyper4k_client_free(Hyper4kClient *client);
+
+/*
+ * Submit a request. on_chunk may be NULL to discard the body.
+ *
+ * Guarantees: *out_request_id is written before any event can be produced, and
+ * no callback re-enters the calling thread synchronously. A callback MAY run on
+ * another thread concurrently with this returning.
+ */
+Hyper4kStatus hyper4k_client_send(Hyper4kClient *client,
+                                  const Hyper4kClientRequest *request,
+                                  Hyper4kOnHeaders on_headers,
+                                  Hyper4kOnChunk on_chunk,
+                                  Hyper4kOnDone on_done,
+                                  void *user_data,
+                                  uint64_t *out_request_id);
+
+/* ACCEPTED / ALREADY_DONE / NOT_FOUND. A cancelled request still gets OnDone. */
+Hyper4kStatus hyper4k_client_cancel(Hyper4kClient *client, uint64_t request_id);
+
+/*
+ * Resume a body paused by HYPER4K_CHUNK_PAUSE. The paused chunk is NOT replayed.
+ * Calling this from inside the pausing callback is allowed and is not lost.
+ */
+Hyper4kStatus hyper4k_client_resume(Hyper4kClient *client, uint64_t request_id);
+
+/* Diagnostics: parked streams across all pooled connections. */
+uint32_t hyper4k_client_paused_stream_count(Hyper4kClient *client);
+
+/* 不透明句柄 */
+typedef struct Hyper4kServer Hyper4kServer;
+typedef uint64_t Hyper4kResponder;
+
 
 /*
  * 单次请求视图。所有切片在 on_request 调用期间有效，

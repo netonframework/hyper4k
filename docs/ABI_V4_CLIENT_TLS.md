@@ -1,8 +1,13 @@
 # hyper4k ABI v4：Client 与 TLS
 
-> 状态：**IMPLEMENTED**（2026-09-02）
-> 设计经五轮评审冻结，实现分 9 个任务落地，Rust 侧 84 个测试 + Kotlin 侧 3 个
-> ABI 断言 + 2 个需联网的公网 HTTPS 用例。
+> 状态：
+> ```
+> CLIENT TLS CORE:              IMPLEMENTED
+> PUBLIC ABI AND RESOURCE CONTRACT: INCOMPLETE
+> RELEASE READINESS:            BLOCKED
+> ```
+> Rust 侧 85 个测试全绿，但那只覆盖了 Rust 内部。对外的 C 头文件尚未声明 client
+> API，因此没有任何消费方能真正接入 —— 单测的绿色不构成"已实现"。
 >
 > 冻结范围：Client TLS、HTTP/1.1 与 HTTP/2 ALPN、连接池、流式响应、背压、取消、
 > 超时、安全重试。

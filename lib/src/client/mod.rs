@@ -84,7 +84,9 @@ pub struct Hyper4kClientRequest {
 /// Fields through `flags` must be present; a caller that supplies less has told
 /// us nothing at all, and "everything defaults" would turn their mistake into a
 /// silent configuration.
-pub const OPTIONS_MIN_SIZE: u32 = 24; // abi_version + struct_size + flags + connect_timeout
+/// Through `flags`: 4 + 4 + 8. The spec freezes this prefix, so it is spelled
+/// out rather than derived from whatever the struct happens to look like.
+pub const OPTIONS_MIN_SIZE: u32 = 16;
 /// Fields through `url`.
 pub const REQUEST_MIN_SIZE: u32 = 8 + 2 * size_of::<Hyper4kSlice>() as u32;
 
@@ -165,6 +167,33 @@ pub unsafe extern "C" fn hyper4k_client_request_init(
         read_idle_timeout_ms: u64::MAX,
     };
     init_prefix(request, struct_size, REQUEST_MIN_SIZE, defaults)
+}
+
+/// Build a full local struct from a caller's (possibly shorter) buffer.
+///
+/// The caller may have been compiled against an older, smaller version of the
+/// struct. Reading their memory as a full one would go past the end of their
+/// allocation; this copies only what they actually provided and leaves the rest
+/// at this build's defaults.
+///
+/// # Safety
+/// `src` must point to at least `caller_size` readable bytes.
+pub(crate) unsafe fn copy_prefix<T>(src: *const u8, caller_size: u32, mut defaults: T) -> T {
+    let n = (caller_size as usize).min(size_of::<T>());
+    std::ptr::copy_nonoverlapping(src, &mut defaults as *mut T as *mut u8, n);
+    defaults
+}
+
+pub(crate) fn defaults_options() -> Hyper4kClientOptions {
+    let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
+    unsafe { hyper4k_client_options_init(&mut o, size_of::<Hyper4kClientOptions>() as u32) };
+    o
+}
+
+pub(crate) fn defaults_request() -> Hyper4kClientRequest {
+    let mut r: Hyper4kClientRequest = unsafe { std::mem::zeroed() };
+    unsafe { hyper4k_client_request_init(&mut r, size_of::<Hyper4kClientRequest>() as u32) };
+    r
 }
 
 /// Shared validation for a caller-supplied versioned struct.

@@ -453,3 +453,120 @@ fn an_unreachable_peer_reports_connect_failure_once() {
     assert_eq!(cap.done_calls.load(Ordering::SeqCst), 1);
     unsafe { hyper4k_client_free(client) };
 }
+
+#[test]
+fn an_illegal_header_is_rejected_instead_of_aborting_the_process() {
+    // The crate is built with panic = "abort", so a builder `expect` on a bad
+    // header name would kill the host process rather than return a status.
+    // A caller must never be able to do that to us.
+    let cap = Arc::new(Capture::default());
+    let client = new_client(0);
+    let url = "http://127.0.0.1:1/x";
+    let mut r: Hyper4kClientRequest = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_request_init(&mut r, std::mem::size_of::<Hyper4kClientRequest>() as u32)
+    };
+    r.method = slice_of(b"GET");
+    r.url = slice_of(url.as_bytes());
+    // A space is not legal in a header name.
+    let bad_name = b"in valid";
+    let value = b"x";
+    let hdr = [crate::abi::Hyper4kHeader {
+        name: slice_of(bad_name),
+        value: slice_of(value),
+    }];
+    r.headers = hdr.as_ptr();
+    r.header_count = 1;
+
+    let mut id = 0u64;
+    let st = unsafe {
+        hyper4k_client_send(
+            client,
+            &r,
+            on_headers,
+            Some(on_chunk),
+            on_done,
+            Arc::as_ptr(&cap) as *mut c_void,
+            &mut id,
+        )
+    };
+    assert_eq!(st, HYPER4K_STATUS_INVALID_ARG);
+    assert!(cap.done.lock().unwrap().is_none());
+    unsafe { hyper4k_client_free(client) };
+}
+
+#[test]
+fn an_illegal_header_value_is_also_rejected() {
+    let cap = Arc::new(Capture::default());
+    let client = new_client(0);
+    let url = "http://127.0.0.1:1/x";
+    let mut r: Hyper4kClientRequest = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_request_init(&mut r, std::mem::size_of::<Hyper4kClientRequest>() as u32)
+    };
+    r.method = slice_of(b"GET");
+    r.url = slice_of(url.as_bytes());
+    let hdr = [crate::abi::Hyper4kHeader {
+        name: slice_of(b"x-test"),
+        value: slice_of(b"bad\nvalue"), // a newline would split the message
+    }];
+    r.headers = hdr.as_ptr();
+    r.header_count = 1;
+    let mut id = 0u64;
+    let st = unsafe {
+        hyper4k_client_send(
+            client,
+            &r,
+            on_headers,
+            Some(on_chunk),
+            on_done,
+            Arc::as_ptr(&cap) as *mut c_void,
+            &mut id,
+        )
+    };
+    assert_eq!(st, HYPER4K_STATUS_INVALID_ARG);
+    unsafe { hyper4k_client_free(client) };
+}
+
+#[test]
+fn a_short_caller_struct_is_not_read_past_its_allocation() {
+    // A caller built against an older, smaller struct. Reading their buffer as
+    // a full one would run off the end of their allocation.
+    let prefix = OPTIONS_MIN_SIZE as usize;
+    let layout =
+        std::alloc::Layout::from_size_align(prefix, std::mem::align_of::<Hyper4kClientOptions>())
+            .unwrap();
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!base.is_null());
+    unsafe {
+        std::ptr::write_unaligned(base as *mut u32, hyper4k_abi_version());
+        std::ptr::write_unaligned(base.add(4) as *mut u32, OPTIONS_MIN_SIZE);
+    }
+    let mut client = std::ptr::null_mut();
+    let st = unsafe { hyper4k_client_new(base as *const Hyper4kClientOptions, &mut client) };
+    assert_eq!(
+        st, HYPER4K_STATUS_OK,
+        "a minimal-prefix caller was rejected"
+    );
+    unsafe {
+        hyper4k_client_free(client);
+        std::alloc::dealloc(base, layout);
+    }
+}
+
+#[test]
+fn a_bad_ca_bundle_fails_at_construction_not_on_first_request() {
+    let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_options_init(&mut o, std::mem::size_of::<Hyper4kClientOptions>() as u32)
+    };
+    let junk = b"not a certificate at all";
+    o.custom_ca_pem = junk.as_ptr();
+    o.custom_ca_pem_len = junk.len();
+    let mut client = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { hyper4k_client_new(&o, &mut client) },
+        HYPER4K_STATUS_INVALID_ARG,
+        "a bad CA bundle was accepted and deferred to the first request"
+    );
+}
