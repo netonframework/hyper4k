@@ -54,8 +54,9 @@ goes in its own module tree rather than growing that file further.
   version and capability entry points. Shared by server and client.
 - Create `lib/src/client/mod.rs` — `Hyper4kClient` handle, options/request structs,
   the six exported client functions.
+- Create `lib/src/client/pool.rs` — connection pool over low-level handshakes.
 - Create `lib/src/client/bridge.rs` — per-request bounded queue, bridge executor,
-  pause permit, generation counter.
+  pause permit, generation counter, terminal gate.
 - Create `lib/src/client/tls.rs` — rustls config construction, root store, ALPN.
 - Create `lib/src/client/retry.rs` — `response_committed`, the provably-unsent
   signal from `try_send_request`, idempotency and retry budget.
@@ -68,7 +69,7 @@ goes in its own module tree rather than growing that file further.
 ## Task 0: Spike — what safety signal does hyper actually give us?
 
 **Throwaway.** The output is an answer recorded in the plan, not code we keep.
-Tasks 3 and 6 both depend on it, so it runs first and blocks them.
+Tasks 4 and 7 both depend on it, so it runs first and blocks them.
 
 **Question:** Can `SendRequest::try_send_request` + `TrySendError::take_message`
 carry the whole retry boundary in spec §四, over both h2 and h1, without parsing
@@ -158,9 +159,21 @@ fails, h1 needs its own staleness check in the pool and Task 6 grows a branch.
 
 - [ ] **Step 3: Record the findings here**
 
-Write the outcome into this plan under Task 6 as a one-paragraph note: which cases
-yield `Some`, which yield `None`, and whether h1 and h2 agree. If any assumption
-broke, stop and re-plan Task 6 before writing production code.
+Write the outcome into this plan under Task 7 as a table, recording **the exact
+hyper version tested** (`cargo tree -p hyper | head -1`) and the result of each of
+the four probes:
+
+| probe | expected | observed | hyper version |
+|---|---|---|---|
+| GOAWAY-excluded stream | `Some` | | |
+| already serialised | `None` | | |
+| h1 stale pooled connection | `Some` | | |
+| committed then died | not replayable | | |
+
+"Source docs say so" is not a finding; only observed behaviour is. If any row
+disagrees, stop and re-plan Task 7 before writing production code. Task 7's
+permanent black-box tests then take over this guarantee — the spike is deleted, so
+nothing but those tests keeps it honest.
 
 - [ ] **Step 4: Delete the spike and commit the findings**
 
@@ -424,18 +437,28 @@ mod tests {
         // (The earlier version of this test embedded a full-size struct before
         // the guard, so a buggy implementation writing the whole struct still
         // left the guard intact — it could not fail.)
-        const PREFIX: usize = OPTIONS_MIN_SIZE as usize;
+        // Allocate through the real layout so the pointer is properly aligned —
+        // casting a Vec<u8> and dereferencing it would be UB regardless of what
+        // the function under test does.
         const GUARD: usize = 64;
-        let mut buf = vec![0xABu8; PREFIX + GUARD];
-        let ptr = buf.as_mut_ptr() as *mut Hyper4kClientOptions;
+        let prefix = OPTIONS_MIN_SIZE as usize;
+        let layout = std::alloc::Layout::from_size_align(
+            prefix + GUARD, std::mem::align_of::<Hyper4kClientOptions>()).unwrap();
+        let base = unsafe { std::alloc::alloc(layout) };
+        assert!(!base.is_null());
+        unsafe { std::ptr::write_bytes(base, 0xAB, prefix + GUARD) };
 
-        let st = unsafe { hyper4k_client_options_init(ptr, OPTIONS_MIN_SIZE) };
+        let st = unsafe { hyper4k_client_options_init(base as *mut _, OPTIONS_MIN_SIZE) };
         assert_eq!(st, HYPER4K_OK);
-        assert!(buf[PREFIX..].iter().all(|&b| b == 0xAB),
+        let tail = unsafe { std::slice::from_raw_parts(base.add(prefix), GUARD) };
+        assert!(tail.iter().all(|&b| b == 0xAB),
                 "init wrote past the caller's struct_size");
-        let written = unsafe { &*ptr };
-        assert_eq!(written.struct_size, OPTIONS_MIN_SIZE);
-        assert_eq!(written.abi_version, hyper4k_abi_version());
+        // Read the two prefix fields without materialising the whole struct.
+        let abi = unsafe { std::ptr::read_unaligned(base as *const u32) };
+        let size = unsafe { std::ptr::read_unaligned(base.add(4) as *const u32) };
+        assert_eq!(abi, hyper4k_abi_version());
+        assert_eq!(size, OPTIONS_MIN_SIZE);
+        unsafe { std::alloc::dealloc(base, layout) };
     }
 
     #[test]
@@ -591,7 +614,172 @@ git commit -m "Add version-safe client options and request initialisers"
 
 ---
 
-## Task 3: Client lifecycle and plaintext request path
+## Task 3: Connection pool
+
+**Files:**
+- Create: `lib/src/client/pool.rs`
+- Test: inline in `lib/src/client/pool.rs`
+
+Switching off `legacy::Client` makes the pool the load-bearing component, so it
+gets its own task, file and tests rather than one line inside the lifecycle task.
+
+**Interfaces:**
+- Consumes: `Hyper4kStatus` (Task 1), TLS config builder (Task 4 provides the real
+  one; this task takes a `Fn() -> ClientConfig` so it can be tested with a stub).
+- Produces:
+  `pub(crate) struct PoolKey { scheme: Scheme, host: String, port: u16, tls_fingerprint: u64 }`;
+  `pub(crate) enum Sender { H1(http1::SendRequest<Full<Bytes>>), H2(http2::SendRequest<Full<Bytes>>) }`;
+  `pub(crate) struct Pool` with
+  `async fn acquire(&self, key: &PoolKey) -> Result<Lease, Hyper4kErrorKind>`,
+  `fn release(&self, lease: Lease)`, `async fn shutdown(&self)`;
+  `pub(crate) struct Lease { sender: Sender, conn_id: u64 }`.
+
+Frozen model:
+
+- **Key** is `(scheme, host, port, tls_fingerprint)`. The TLS fingerprint hashes the
+  root-store choice and `HTTP2_REQUIRED`, so two clients with different trust
+  configuration never share a connection.
+- **h1 connections are exclusive**, one in-flight request each; **h2 connections
+  multiplex** up to `current_max_send_streams()`.
+- **ALPN decides the sender variant** after the handshake — the pool does not guess
+  from the URL.
+- **Each connection owns a driver task.** The pool holds its `JoinHandle`; the
+  driver ends when the connection closes or `shutdown()` aborts it. `shutdown()`
+  must join every driver, otherwise `hyper4k_client_free` can hang.
+- **Eviction:** a lease is discarded on release if `is_closed()`, and an h2
+  connection stops accepting new streams once its paused-stream count reaches the
+  window-reservation cap from spec §2.5.
+- **Dial de-duplication:** concurrent `acquire` calls for the same key await one
+  in-flight dial via a `DashMap<PoolKey, Shared<...>>`, so a burst of requests to
+  one authority opens one connection, not N.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn h2_requests_to_one_authority_share_a_connection() {
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(stub_tls());
+        let key = key_for(&peer);
+        let a = pool.acquire(&key).await.unwrap();
+        let b = pool.acquire(&key).await.unwrap();
+        assert_eq!(a.conn_id, b.conn_id, "h2 must multiplex, not redial");
+    }
+
+    #[tokio::test]
+    async fn h1_requests_do_not_share_a_connection() {
+        let peer = spawn_h1_server().await;
+        let pool = Pool::new(stub_tls());
+        let key = key_for(&peer);
+        let a = pool.acquire(&key).await.unwrap();
+        let b = pool.acquire(&key).await.unwrap();
+        assert_ne!(a.conn_id, b.conn_id, "h1 connections are exclusive");
+    }
+
+    #[tokio::test]
+    async fn concurrent_acquires_dial_once() {
+        let peer = spawn_h2_server_counting_accepts().await;
+        let pool = Pool::new(stub_tls());
+        let key = key_for(&peer);
+        let leases = futures::future::join_all(
+            (0..16).map(|_| pool.acquire(&key))
+        ).await;
+        assert!(leases.iter().all(|l| l.is_ok()));
+        assert_eq!(peer.accept_count(), 1, "connection storm: dialed more than once");
+    }
+
+    #[tokio::test]
+    async fn different_tls_policy_does_not_share_a_connection() {
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(stub_tls());
+        let a = pool.acquire(&key_with_fingerprint(&peer, 1)).await.unwrap();
+        let b = pool.acquire(&key_with_fingerprint(&peer, 2)).await.unwrap();
+        assert_ne!(a.conn_id, b.conn_id, "trust config must partition the pool");
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_is_evicted_on_release() {
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(stub_tls());
+        let key = key_for(&peer);
+        let lease = pool.acquire(&key).await.unwrap();
+        peer.drop_all_connections();
+        wait_until_async(|| lease.sender.is_closed()).await;
+        let old = lease.conn_id;
+        pool.release(lease);
+        let fresh = pool.acquire(&key).await.unwrap();
+        assert_ne!(fresh.conn_id, old, "a dead connection was handed out again");
+    }
+
+    #[tokio::test]
+    async fn alpn_result_selects_the_sender_variant() {
+        let h2_peer = spawn_tls_server_alpn(&["h2"]).await;
+        let h1_peer = spawn_tls_server_alpn(&["http/1.1"]).await;
+        let pool = Pool::new(real_tls());
+        assert!(matches!(pool.acquire(&key_for(&h2_peer)).await.unwrap().sender,
+                         Sender::H2(_)));
+        assert!(matches!(pool.acquire(&key_for(&h1_peer)).await.unwrap().sender,
+                         Sender::H1(_)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_every_connection_driver() {
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(stub_tls());
+        let _lease = pool.acquire(&key_for(&peer)).await.unwrap();
+        // If a driver task outlives shutdown, hyper4k_client_free would hang.
+        tokio::time::timeout(Duration::from_secs(5), pool.shutdown())
+            .await
+            .expect("shutdown did not join its drivers");
+    }
+
+    #[tokio::test]
+    async fn an_h2_connection_at_the_paused_cap_stops_taking_new_streams() {
+        let peer = spawn_h2_server().await;
+        let pool = Pool::new(stub_tls()).with_paused_cap(2);
+        let key = key_for(&peer);
+        let a = pool.acquire(&key).await.unwrap();
+        pool.mark_paused(a.conn_id);
+        pool.mark_paused(a.conn_id);
+        let c = pool.acquire(&key).await.unwrap();
+        assert_ne!(c.conn_id, a.conn_id,
+                   "new stream landed on a connection at its paused cap");
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cd lib && cargo test --lib client::pool_tests`
+Expected: FAIL — `Pool` not found
+
+- [ ] **Step 3: Implement the pool**
+
+Follow the frozen model above. `acquire` looks up the key, reuses a live h2 lease
+below its stream and paused caps, otherwise joins or starts a dial. A dial performs
+TCP connect, optional TLS, then `http2::handshake` or `http1::handshake` based on
+the negotiated ALPN protocol, spawns the connection driver and stores its
+`JoinHandle`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cd lib && cargo test --lib client::pool_tests`
+Expected: PASS, 8 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/src/client/pool.rs lib/src/client/mod.rs
+git commit -m "Add the connection pool"
+```
+
+---
+
+## Task 4: Client lifecycle and plaintext request path
 
 **Files:**
 - Modify: `lib/src/client/mod.rs`
@@ -816,14 +1004,28 @@ unwinding. What is actually guaranteed, and all that is promised:
 Update spec §2.6's wording to this contract as part of this task; the absolute
 phrasing there ("绝不触发任何回调") overstates what a callee can guarantee.
 
-**Termination goes through one place.** `RequestHandle` holds
-`settle: OnceLock<()>` and a `settle_once(kind: Hyper4kErrorKind)` method that
-atomically claims the right to finish the request, enqueues exactly one `OnDone`,
-and only then aborts the network task. Aborting a tokio task does **not** run its
-ordinary cleanup path, so "abort and let the task emit OnDone" would silently drop
-the callback. `close` walks the map calling `settle_once(CANCELLED)`; `cancel` and
-every error path call the same function. `free` blocks on a `tokio::sync::Notify`
-until the handle map is empty, then drops the runtime.
+**Termination goes through one place, and the terminal gate comes first.**
+Aborting a tokio task does **not** run its ordinary cleanup path, so "abort and let
+the task emit OnDone" would silently drop the callback. But enqueueing `OnDone` and
+*then* aborting also leaves a window: between those two points the network task can
+still push headers or a chunk, and the caller sees a callback after `OnDone`.
+
+`settle_once(kind)` therefore runs in this order, and the order is the contract:
+
+1. **Atomically flip the request state to `TERMINAL`** (`compare_exchange` on an
+   `AtomicU8`). Losing the race means someone else is settling; return immediately.
+2. **The bridge drops every non-`Done` event for this request from now on** — both
+   already-queued ones and any that arrive later. This is what discards the
+   queued-but-undelivered headers in spec §四.
+3. Close the event producer side of the request's queue.
+4. Enqueue `OnDone` as the **last** event on that queue.
+5. Abort the network task.
+6. Remove the handle from the map **only after `OnDone` has returned**, so
+   `user_data` stays alive for the whole callback.
+
+`close` walks the map calling `settle_once(CANCELLED)`; `cancel` and every error
+path call the same function. `free` blocks on a `tokio::sync::Notify` until the
+handle map is empty, then drops the runtime.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -849,7 +1051,7 @@ git commit -m "Add the client lifecycle and the plaintext request path"
 
 ---
 
-## Task 4: TLS, ALPN and error classification
+## Task 5: TLS, ALPN and error classification
 
 **Files:**
 - Create: `lib/src/client/tls.rs`
@@ -1005,7 +1207,7 @@ git commit -m "Add TLS with ALPN and classified handshake failures"
 
 ---
 
-## Task 5: Backpressure
+## Task 6: Backpressure
 
 **Files:**
 - Modify: `lib/src/client/bridge.rs`, `lib/src/client/mod.rs`
@@ -1142,7 +1344,7 @@ git commit -m "Express backpressure through the chunk callback"
 
 ---
 
-## Task 6: Retry, GOAWAY and timeouts
+## Task 7: Retry and timeouts
 
 **Files:**
 - Create: `lib/src/client/retry.rs`
@@ -1280,10 +1482,23 @@ Expected: FAIL — `Attempt` not found
 `Attempt` carries a monotonically increasing generation and an irreversible
 `response_committed` flag set **before the first response event is pushed onto the
 bridge queue**, not after a callback returns. Bridge events carry their generation
-and are dropped if it no longer matches. `may_retry` returns false whenever
-`response_committed` is set; otherwise it applies the GOAWAY table: retry when the
-stream id exceeds `last_stream_id` or the peer sent `REFUSED_STREAM`, retry
-in-flight idempotent methods on connection loss, and refuse everything else.
+and are dropped if it no longer matches.
+
+`may_retry` is a pure function of four inputs — there is no GOAWAY frame, no
+`last_stream_id` and no stream id anywhere in this module:
+
+| `committed` | `provably_unsent` | method | budget | outcome |
+|---|---|---|---|---|
+| true | — | — | — | no retry, `OnDone(TRUNCATED)` |
+| false | true | any | > 0 | **retry** (safe by protocol, method irrelevant) |
+| false | true | any | 0 | no retry, report the transport error |
+| false | false | idempotent | > 0 | retry |
+| false | false | idempotent | 0 | no retry, report the transport error |
+| false | false | non-idempotent | — | no retry, `OnDone(OUTCOME_UNKNOWN)` |
+
+`provably_unsent` is `TrySendError::take_message().is_some()`. Idempotent methods
+are GET, HEAD, PUT, DELETE, OPTIONS, TRACE.
+
 Retries reuse the same `request_id`. The overall deadline is computed once at
 `send` and shared across attempts; the idle deadline is rearmed on every delivered
 chunk.
@@ -1302,7 +1517,7 @@ git commit -m "Add the RFC 9113 retry state machine"
 
 ---
 
-## Task 7: Platform matrix and real-world verification
+## Task 8: Platform matrix and real-world verification
 
 **Files:**
 - Modify: `build.gradle.kts:20,33` (drop the mingw triple and target)
@@ -1340,22 +1555,43 @@ Expected: PASS on both.
 Acceptance #43 wants the check on *both* sides; only the Rust half exists so far.
 Add to `src/nativeTest/kotlin/hyper4k/AbiWidthTest.kt` in this repo:
 
+`assertEquals(4, Int.SIZE_BYTES)` would pass no matter what the header says, so the
+real check is a **compile-time** one: assign each ABI constant into an explicitly
+typed `Int`. If a type reverts to a bare C `enum`, cinterop maps it to something
+else and this stops compiling.
+
 ```kotlin
 import kotlinx.cinterop.ExperimentalForeignApi
+import hyper4k.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
 @OptIn(ExperimentalForeignApi::class)
 class AbiWidthTest {
     @Test
-    fun statusAndActionTypesAreFourBytes() {
-        // cinterop maps `typedef int32_t Hyper4kStatus` to kotlin.Int.
-        // If someone reverts the header to a bare C enum, the mapped width
-        // can change and this fails.
-        assertEquals(4, Int.SIZE_BYTES)
-        assertEquals(hyper4k.HYPER4K_ABI_VERSION.toInt(), (4 shl 16) or 0)
+    fun abiScalarsMapToKotlinInt() {
+        // Each of these fails to COMPILE if cinterop stops mapping the type to Int.
+        val status: Int = HYPER4K_OK
+        val err: Int = HYPER4K_ERR_OUTCOME_UNKNOWN
+        val headersAction: Int = HYPER4K_HEADERS_CANCEL
+        val chunkAction: Int = HYPER4K_CHUNK_PAUSE
+
+        assertEquals(0, status)
+        assertEquals(13, err)
+        assertEquals(2, headersAction)
+        assertEquals(1, chunkAction)
+        assertEquals((4 shl 16) or 0, hyper4k_abi_version().toInt())
     }
 }
+```
+
+Also add to `lib/include/hyper4k.h`, so a C consumer fails at compile time too:
+
+```c
+_Static_assert(sizeof(Hyper4kStatus)        == 4, "Hyper4kStatus must be 32-bit");
+_Static_assert(sizeof(Hyper4kErrorKind)     == 4, "Hyper4kErrorKind must be 32-bit");
+_Static_assert(sizeof(Hyper4kHeadersAction) == 4, "Hyper4kHeadersAction must be 32-bit");
+_Static_assert(sizeof(Hyper4kChunkAction)   == 4, "Hyper4kChunkAction must be 32-bit");
 ```
 
 Run: `./gradlew macosArm64Test`
@@ -1411,8 +1647,8 @@ git commit -m "Ship the client on the four supported platforms"
 
 ## Self-Review
 
-**Task 0 gates Tasks 3 and 6.** If the spike shows h1 and h2 disagree on the
-provably-unsent signal, Task 6 needs a per-protocol branch and must be re-planned
+**Task 0 gates Tasks 4 and 7.** If the spike shows h1 and h2 disagree on the
+provably-unsent signal, Task 7 needs a per-protocol branch and must be re-planned
 before any production code is written. Do not skip ahead.
 
 **Spec coverage.** §二 ABI basics → Task 1–2. §三 TLS → Task 4. §四 GOAWAY and
