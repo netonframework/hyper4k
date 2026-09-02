@@ -374,8 +374,14 @@ request 同样有**最小合法 `struct_size`**（到 `url` 为止），小于�
 
 ```c
 
-/* **返回前绝不触发任何回调**，且已复制 method / url / headers / body 全部输入
-   切片 —— 返回后调用方缓冲即可释放。 */
+/* 已复制 method / url / headers / body 全部输入切片 —— 返回后调用方缓冲即可释放。
+
+   回调时序契约（callee 能真正保证的范围）：
+     1. *out_request_id 在该请求可能产生任何事件之前写好；
+     2. 回调**不会在调用 send() 的线程上同步重入**；
+     3. 回调**可以**在另一线程上与 send() 的返回边界并发发生。
+   早先写的"返回前绝不触发任何回调"做不到：spawn 出去的任务可能在 send() 尚未
+   返回时就在别的 worker 上跑起来，而这种绝对时序无法由被调方单方面证明。 */
 Hyper4kStatus hyper4k_client_send(Hyper4kClient *client,
                                   const Hyper4kClientRequest *request,
                                   Hyper4kOnHeaders on_headers,
@@ -538,7 +544,8 @@ Rust 侧自动化测试，全部用本地生成的 CA 与证书：
    - 重试次数上限生效：持续 `REFUSED_STREAM` 不会活锁
 8. 生命周期：`close` 后每个已接受请求恰好一次 `OnDone`；`free` 返回后无任何回调
 9. 背压：慢消费者只拖慢自身 stream，不阻塞 I/O worker，不无界缓存
-10. `send()` 返回前不触发任何回调
+10. 回调时序契约：`*out_request_id` 先于任何事件写好；回调不在 `send()` 调用线程
+    同步重入（构造一个在回调里断言"当前线程不是 send 线程"的用例）
 11. 错误分类可区分 DNS / 连接 / CA / hostname / 过期 / ALPN / 超时 / 取消
 12. HTTP 4xx/5xx 走成功路径（`OnDone(NULL)`），不进 error
 13. `cancel` 三态正确，且取消胜出后仍收到一次 `OnDone(CANCELLED)`
