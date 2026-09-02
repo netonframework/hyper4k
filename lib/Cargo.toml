@@ -37,6 +37,10 @@ time = "0.3"
 tokio-stream = "0.1"
 futures-core = "0.3"
 
+[[bench]]
+name = "three_layer"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
