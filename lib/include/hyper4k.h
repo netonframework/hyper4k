@@ -25,6 +25,84 @@
 extern "C" {
 #endif
 
+/* ---------------------------------------------------------------------------
+ * ABI v4: shared surface
+ *
+ * Every type crossing this boundary is fixed width. A C `enum` has
+ * implementation-defined width, so freezing values without freezing the
+ * representation would freeze nothing. The static assertions below fail the
+ * build if that ever regresses.
+ * ------------------------------------------------------------------------- */
+
+typedef int32_t Hyper4kStatus;
+
+#define HYPER4K_STATUS_OK                 ((Hyper4kStatus)  0)
+#define HYPER4K_STATUS_ABI_MISMATCH       ((Hyper4kStatus) -1)
+#define HYPER4K_STATUS_STRUCT_SIZE        ((Hyper4kStatus) -2)
+#define HYPER4K_STATUS_UNKNOWN_FLAGS      ((Hyper4kStatus) -3)
+#define HYPER4K_STATUS_INVALID_ARG        ((Hyper4kStatus) -4)
+#define HYPER4K_STATUS_UNSUPPORTED        ((Hyper4kStatus) -5)
+#define HYPER4K_STATUS_CLIENT_CLOSED      ((Hyper4kStatus) -6)
+#define HYPER4K_STATUS_OOM                ((Hyper4kStatus) -7)
+#define HYPER4K_STATUS_RESOURCE_EXHAUSTED ((Hyper4kStatus) -8)
+#define HYPER4K_STATUS_NOT_FOUND          ((Hyper4kStatus)-20)
+#define HYPER4K_STATUS_ALREADY_DONE       ((Hyper4kStatus)-21)
+#define HYPER4K_STATUS_NOT_PAUSED         ((Hyper4kStatus)-22)
+
+typedef int32_t Hyper4kErrorKind;
+
+#define HYPER4K_ERR_NONE             ((Hyper4kErrorKind)  0)
+#define HYPER4K_ERR_DNS              ((Hyper4kErrorKind)  1)
+#define HYPER4K_ERR_CONNECT          ((Hyper4kErrorKind)  2)
+#define HYPER4K_ERR_TLS_CA           ((Hyper4kErrorKind)  3)
+#define HYPER4K_ERR_TLS_HOSTNAME     ((Hyper4kErrorKind)  4)
+#define HYPER4K_ERR_TLS_EXPIRED      ((Hyper4kErrorKind)  5)
+#define HYPER4K_ERR_TLS_OTHER        ((Hyper4kErrorKind)  6)
+#define HYPER4K_ERR_ALPN_NO_H2       ((Hyper4kErrorKind)  7)
+#define HYPER4K_ERR_PROTOCOL         ((Hyper4kErrorKind)  8)
+#define HYPER4K_ERR_TIMEOUT          ((Hyper4kErrorKind)  9)
+#define HYPER4K_ERR_IDLE_TIMEOUT     ((Hyper4kErrorKind) 10)
+#define HYPER4K_ERR_CANCELLED        ((Hyper4kErrorKind) 11)
+#define HYPER4K_ERR_TRUNCATED        ((Hyper4kErrorKind) 12)
+#define HYPER4K_ERR_OUTCOME_UNKNOWN  ((Hyper4kErrorKind) 13)
+
+/* Headers have no "pause before the next chunk", so the two actions are
+   separate types rather than one enum with an undefined combination. */
+typedef int32_t Hyper4kHeadersAction;
+#define HYPER4K_HEADERS_CONTINUE ((Hyper4kHeadersAction) 0)
+#define HYPER4K_HEADERS_CANCEL   ((Hyper4kHeadersAction) 2)
+
+typedef int32_t Hyper4kChunkAction;
+#define HYPER4K_CHUNK_CONTINUE   ((Hyper4kChunkAction) 0)
+#define HYPER4K_CHUNK_PAUSE      ((Hyper4kChunkAction) 1)
+#define HYPER4K_CHUNK_CANCEL     ((Hyper4kChunkAction) 2)
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(Hyper4kStatus)        == 4, "Hyper4kStatus must be 32-bit");
+_Static_assert(sizeof(Hyper4kErrorKind)     == 4, "Hyper4kErrorKind must be 32-bit");
+_Static_assert(sizeof(Hyper4kHeadersAction) == 4, "Hyper4kHeadersAction must be 32-bit");
+_Static_assert(sizeof(Hyper4kChunkAction)   == 4, "Hyper4kChunkAction must be 32-bit");
+#endif
+
+/* (major << 16) | minor */
+uint32_t    hyper4k_abi_version(void);
+/* NUL-terminated, static storage. Do not free. */
+const char *hyper4k_version(void);
+/* Bit is set only when the feature is implemented AND tested. */
+uint64_t    hyper4k_server_capabilities(void);
+uint64_t    hyper4k_client_capabilities(void);
+
+#define HYPER4K_SERVER_CAP_HTTP1     (1ull << 0)
+#define HYPER4K_SERVER_CAP_H2C       (1ull << 1)
+#define HYPER4K_SERVER_CAP_STREAMING (1ull << 2)
+
+#define HYPER4K_CLIENT_CAP_HTTP1     (1ull << 0)
+#define HYPER4K_CLIENT_CAP_HTTP2     (1ull << 1)
+#define HYPER4K_CLIENT_CAP_TLS       (1ull << 2)
+#define HYPER4K_CLIENT_CAP_CUSTOM_CA (1ull << 3)
+#define HYPER4K_CLIENT_CAP_CANCEL    (1ull << 4)
+#define HYPER4K_CLIENT_CAP_STREAMING (1ull << 5)
+
 /* 不透明句柄 */
 typedef struct Hyper4kServer Hyper4kServer;
 typedef uint64_t Hyper4kResponder;

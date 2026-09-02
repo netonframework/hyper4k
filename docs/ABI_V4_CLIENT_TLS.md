@@ -92,7 +92,7 @@ typedef struct { Hyper4kSlice name; Hyper4kSlice value; } Hyper4kHeader;
 ```c
 typedef int32_t Hyper4kStatus;
 
-#define HYPER4K_OK                        ((Hyper4kStatus)  0)
+#define HYPER4K_STATUS_OK                 ((Hyper4kStatus)  0)
 
 /* 提交期参数与状态 */
 #define HYPER4K_STATUS_ABI_MISMATCH       ((Hyper4kStatus) -1)  /* abi_version 不兼容 */
@@ -112,6 +112,10 @@ typedef int32_t Hyper4kStatus;
 
 `OOM` 与 `RESOURCE_EXHAUSTED` 不同：前者是分配器真的失败（`try_reserve` 之类），
 后者是我们**主动**拒绝以守住内存上限。把主动限流报成 OOM 会误导运维去查内存泄漏。
+
+> 成功码叫 `HYPER4K_STATUS_OK` 而不是 `HYPER4K_OK`：ABI v3 已经发布了
+> `HYPER4K_OK = 1`（`hyper4k_respond` 的"已交付"）。同一个名字两个值，对 C 调用方
+> 是无类型检查的静默陷阱 —— 实现 Task 1 时编译器报了宏重定义才发现。
 
 `Hyper4kStatus` 是**同步**通道，`Hyper4kErrorKind`（§2.4）是**异步**通道。二者不
 重叠：提交期失败只出现在返回值里，不会再触发 `OnDone`；反之亦然。所以上一版那个
@@ -306,10 +310,10 @@ chunk** —— 否则调用方必须自己去重，那等于把背压的复杂�
 
 | `resume()` 调用时机 | 返回 | permit 处理 |
 |---|---|---|
-| 当前 chunk 回调仍在执行中 | `HYPER4K_OK` | 记下 permit，**只属于本次 chunk** |
+| 当前 chunk 回调仍在执行中 | `HYPER4K_STATUS_OK` | 记下 permit，**只属于本次 chunk** |
 | 该回调随后返回 `PAUSE` | —— | **立即消费 permit**，不真正挂起 |
 | 该回调随后返回 `CONTINUE` / `CANCEL` | —— | **丢弃 permit**，绝不影响以后任何 chunk |
-| 请求确实处于暂停态 | `HYPER4K_OK` | 解除挂起 |
+| 请求确实处于暂停态 | `HYPER4K_STATUS_OK` | 解除挂起 |
 | 既无回调执行中，也未暂停 | `HYPER4K_STATUS_NOT_PAUSED` | —— |
 
 **每个 request 一条独立的有界队列**，不是每个 client 一条。共用一条时慢 stream 会

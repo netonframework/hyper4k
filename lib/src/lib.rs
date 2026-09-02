@@ -5,6 +5,8 @@
 //!
 //! 详细 ABI 契约见 `include/hyper4k.h`。
 
+pub mod abi;
+
 use std::cell::Cell;
 use std::convert::Infallible;
 use std::ffi::{c_char, c_void, CStr};

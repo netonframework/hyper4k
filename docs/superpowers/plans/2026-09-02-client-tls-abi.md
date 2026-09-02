@@ -226,7 +226,7 @@ git commit -m "Record what the hyper retry signal guarantees"
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `pub type Hyper4kStatus = i32;` and its constants
-  (`HYPER4K_OK = 0`, `HYPER4K_STATUS_ABI_MISMATCH = -1`, `_STRUCT_SIZE = -2`,
+  (`HYPER4K_STATUS_OK = 0`, `HYPER4K_STATUS_ABI_MISMATCH = -1`, `_STRUCT_SIZE = -2`,
   `_UNKNOWN_FLAGS = -3`, `_INVALID_ARG = -4`, `_UNSUPPORTED = -5`,
   `_CLIENT_CLOSED = -6`, `_OOM = -7`, `_RESOURCE_EXHAUSTED = -8`,
   `_NOT_FOUND = -20`, `_ALREADY_DONE = -21`, `_NOT_PAUSED = -22`);
@@ -250,7 +250,7 @@ mod tests {
     fn status_values_are_frozen() {
         // These numbers are published across languages. Changing one is a
         // breaking change, so pin them literally rather than by expression.
-        assert_eq!(HYPER4K_OK, 0);
+        assert_eq!(HYPER4K_STATUS_OK, 0);
         assert_eq!(HYPER4K_STATUS_ABI_MISMATCH, -1);
         assert_eq!(HYPER4K_STATUS_STRUCT_SIZE, -2);
         assert_eq!(HYPER4K_STATUS_UNKNOWN_FLAGS, -3);
@@ -294,7 +294,7 @@ use std::ffi::c_char;
 
 pub type Hyper4kStatus = i32;
 
-pub const HYPER4K_OK: Hyper4kStatus = 0;
+pub const HYPER4K_STATUS_OK: Hyper4kStatus = 0;
 pub const HYPER4K_STATUS_ABI_MISMATCH: Hyper4kStatus = -1;
 pub const HYPER4K_STATUS_STRUCT_SIZE: Hyper4kStatus = -2;
 pub const HYPER4K_STATUS_UNKNOWN_FLAGS: Hyper4kStatus = -3;
@@ -440,7 +440,7 @@ mod tests {
         let st = unsafe {
             hyper4k_client_options_init(&mut o, std::mem::size_of::<Hyper4kClientOptions>() as u32)
         };
-        assert_eq!(st, HYPER4K_OK);
+        assert_eq!(st, HYPER4K_STATUS_OK);
         assert_eq!(o.abi_version, hyper4k_abi_version());
         // The whole point of the init function: a zeroed struct would mean
         // "no retries", which is a different intent from "use the default".
@@ -453,7 +453,7 @@ mod tests {
         let st = unsafe {
             hyper4k_client_request_init(&mut r, std::mem::size_of::<Hyper4kClientRequest>() as u32)
         };
-        assert_eq!(st, HYPER4K_OK);
+        assert_eq!(st, HYPER4K_STATUS_OK);
         // 0 would mean "disabled", silently dropping the client default.
         assert_eq!(r.read_idle_timeout_ms, u64::MAX);
     }
@@ -479,7 +479,7 @@ mod tests {
         unsafe { std::ptr::write_bytes(base, 0xAB, prefix + GUARD) };
 
         let st = unsafe { hyper4k_client_options_init(base as *mut _, OPTIONS_MIN_SIZE) };
-        assert_eq!(st, HYPER4K_OK);
+        assert_eq!(st, HYPER4K_STATUS_OK);
         let tail = unsafe { std::slice::from_raw_parts(base.add(prefix), GUARD) };
         assert!(tail.iter().all(|&b| b == 0xAB),
                 "init wrote past the caller's struct_size");
@@ -505,7 +505,7 @@ mod tests {
         unsafe { std::ptr::write_bytes(base, 0xCD, big) };
         // Ask for more than this build knows: init must clamp to its own size.
         let st = unsafe { hyper4k_client_options_init(base as *mut _, big as u32) };
-        assert_eq!(st, HYPER4K_OK);
+        assert_eq!(st, HYPER4K_STATUS_OK);
         let tail = unsafe { std::slice::from_raw_parts(base.add(known), big - known) };
         assert!(tail.iter().all(|&b| b == 0xCD),
                 "init touched fields beyond what this build defines");
@@ -594,7 +594,7 @@ unsafe fn init_prefix<T>(ptr: *mut T, struct_size: u32, min_size: u32, defaults:
         writable,
     );
     std::mem::forget(defaults);
-    HYPER4K_OK
+    HYPER4K_STATUS_OK
 }
 
 #[no_mangle]
@@ -966,7 +966,7 @@ mod lifecycle_tests {
         let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
         unsafe { hyper4k_client_options_init(&mut o, size_of::<Hyper4kClientOptions>() as u32) };
         let mut client = std::ptr::null_mut();
-        assert_eq!(unsafe { hyper4k_client_new(&o, &mut client) }, HYPER4K_OK);
+        assert_eq!(unsafe { hyper4k_client_new(&o, &mut client) }, HYPER4K_STATUS_OK);
 
         let url = format!("http://{addr}/ping");
         let mut req: Hyper4kClientRequest = unsafe { std::mem::zeroed() };
@@ -979,7 +979,7 @@ mod lifecycle_tests {
             hyper4k_client_send(client, &req, on_headers, on_chunk, on_done,
                                 Arc::as_ptr(&cap) as *mut c_void, &mut id)
         };
-        assert_eq!(st, HYPER4K_OK);
+        assert_eq!(st, HYPER4K_STATUS_OK);
         assert_ne!(id, 0);
 
         wait_until(|| cap.done.lock().unwrap().is_some());
@@ -1042,7 +1042,7 @@ mod lifecycle_tests {
             hyper4k_client_send(client, &req, on_headers, on_chunk, on_done,
                                 Arc::as_ptr(&cap) as *mut c_void, &mut id)
         };
-        assert_eq!(unsafe { hyper4k_client_cancel(client, id) }, HYPER4K_OK);
+        assert_eq!(unsafe { hyper4k_client_cancel(client, id) }, HYPER4K_STATUS_OK);
         wait_until(|| cap.done.lock().unwrap().is_some());
         assert_eq!(*cap.done.lock().unwrap(), Some(HYPER4K_ERR_CANCELLED));
         assert_eq!(unsafe { hyper4k_client_cancel(client, id) }, HYPER4K_STATUS_ALREADY_DONE);
@@ -1063,7 +1063,7 @@ mod lifecycle_tests {
             hyper4k_client_send(client, &req, on_headers, None, on_done,
                                 Arc::as_ptr(&cap) as *mut c_void, &mut id)
         };
-        assert_eq!(st, HYPER4K_OK);
+        assert_eq!(st, HYPER4K_STATUS_OK);
         wait_until(|| cap.done.lock().unwrap().is_some());
         assert_eq!(*cap.done.lock().unwrap(), Some(-999));
         assert!(cap.body.lock().unwrap().is_empty());
@@ -1102,7 +1102,7 @@ mod lifecycle_tests {
         let client = new_client_with_paused_bridge();
         let id = send_on(client, &format!("http://{addr}/x"), cap.clone());
         wait_until(|| bridge_backlog(client, id) >= 3);
-        assert_eq!(unsafe { hyper4k_client_cancel(client, id) }, HYPER4K_OK);
+        assert_eq!(unsafe { hyper4k_client_cancel(client, id) }, HYPER4K_STATUS_OK);
         release_bridge(client);
         wait_until(|| cap.done.lock().unwrap().is_some());
 
@@ -1150,7 +1150,7 @@ mod lifecycle_tests {
                                     Arc::as_ptr(&cap) as *mut c_void, &mut id)
             };
             closer.join().unwrap();
-            if st == HYPER4K_OK {
+            if st == HYPER4K_STATUS_OK {
                 wait_until(|| cap.done.lock().unwrap().is_some());
                 assert_eq!(cap.done_calls(), 1, "accepted request must settle exactly once");
             } else {
@@ -1500,7 +1500,7 @@ mod backpressure_tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(seen.lock().unwrap().len(), 1, "delivery continued while paused");
 
-        assert_eq!(unsafe { hyper4k_client_resume(client.ptr, client.id) }, HYPER4K_OK);
+        assert_eq!(unsafe { hyper4k_client_resume(client.ptr, client.id) }, HYPER4K_STATUS_OK);
         wait_until(|| seen.lock().unwrap().len() == 3);
         let got = seen.lock().unwrap().clone();
         assert_eq!(got, vec![b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()],
@@ -1583,7 +1583,7 @@ Expected: FAIL — `hyper4k_client_resume` not found
 - [ ] **Step 3: Implement backpressure**
 
 Each request owns a `PausePermit { armed: AtomicBool, generation: AtomicU64 }`.
-`resume` sets `armed` for the **current** generation and returns `HYPER4K_OK` when
+`resume` sets `armed` for the **current** generation and returns `HYPER4K_STATUS_OK` when
 the request is paused or a chunk callback is running; `HYPER4K_STATUS_NOT_PAUSED`
 otherwise. After a chunk callback returns, the bridge increments the generation:
 on `PAUSE` it first tries `permit.take()` and only parks if that fails; on
@@ -1861,7 +1861,7 @@ class AbiWidthTest {
     @Test
     fun abiScalarsMapToKotlinInt() {
         // Each of these fails to COMPILE if cinterop stops mapping the type to Int.
-        val status: Int = HYPER4K_OK
+        val status: Int = HYPER4K_STATUS_OK
         val err: Int = HYPER4K_ERR_OUTCOME_UNKNOWN
         val headersAction: Int = HYPER4K_HEADERS_CANCEL
         val chunkAction: Int = HYPER4K_CHUNK_PAUSE
