@@ -378,15 +378,14 @@ async fn run_request(
     let response = match sent {
         Ok(resp) => resp,
         Err(mut e) => {
-            let provably_unsent = e.take_message().is_some();
-            let kind = if provably_unsent {
-                HYPER4K_ERR_OUTCOME_UNKNOWN // Task 7 turns this into a retry
-            } else {
-                HYPER4K_ERR_OUTCOME_UNKNOWN
-            };
+            // `Some` means hyper had not written the request when the failure
+            // surfaced, so it is provably unsent and safe to replay. Task 7
+            // turns that into an actual retry; until then both paths report the
+            // same conservative outcome.
+            let _provably_unsent = e.take_message().is_some();
             handle.settle(
                 Terminal {
-                    kind,
+                    kind: HYPER4K_ERR_OUTCOME_UNKNOWN,
                     protocol_code: 0,
                     message: "send failed".into(),
                 },
