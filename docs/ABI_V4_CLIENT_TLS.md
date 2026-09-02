@@ -468,6 +468,19 @@ Hyper4kStatus hyper4k_client_cancel(Hyper4kClient *client, uint64_t request_id);
 `request_timeout_ms` **覆盖全部重试**，不因每次重试而重置 —— 否则"总超时"就不是
 上限，一个反复失败的请求能挂到 `max_retries × timeout`。
 
+> **非规范性实现注记（不是 ABI 契约的一部分）**
+>
+> 当前 Hyper 1.11 参考实现使用低层 `SendRequest::try_send_request()` 与
+> `TrySendError::take_message()` 判断请求是否**确定未发送**，**不自行解析 GOAWAY
+> 的 `last_stream_id`** —— hyper 的 h2 层已经算好了这个边界。
+>
+> - `Some(request)`：请求未完成序列化到连接，可证明未发送，任何方法都可透明重试。
+> - `None`：**不等于请求已执行**，只表示无法证明未发送。此时按本节规则处理。
+> - `response_committed = true`：无论方法与错误类型，一律禁止重试，返回 `TRUNCATED`。
+>
+> 记在这里是为了防止后来者照字面去实现帧解析；但语义由本节定义，不绑死在任何一个
+> Hyper API 名称上。换实现只要满足同样的判定即可。
+
 APNs 的 POST 同样适用。只有传输层能证明请求未被处理时才自动重试；其余情况交给
 上层按 `apns-id` 与业务策略决定。为了"可靠推送"而盲目重试会制造重复通知。
 
