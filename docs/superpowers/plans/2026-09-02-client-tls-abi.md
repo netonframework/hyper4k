@@ -655,9 +655,8 @@ nothing about ALPN.
 
 Frozen model:
 
-- **Key** is `(scheme, host, port, tls_fingerprint)`. The TLS fingerprint hashes the
-  root-store choice and `HTTP2_REQUIRED`, so two clients with different trust
-  configuration never share a connection.
+- **Key** is `(scheme, host, port)`. Nothing about trust configuration enters it:
+  the pool belongs to one client, and one client has exactly one TLS policy.
 - **h1 connections are exclusive**, one in-flight request each; **h2 connections
   multiplex** up to `current_max_send_streams()`.
 - **ALPN decides the sender variant** after the handshake — the pool does not guess
