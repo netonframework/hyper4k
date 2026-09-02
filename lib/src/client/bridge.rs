@@ -181,16 +181,6 @@ impl RequestState {
         !self.discarding()
     }
 
-    /// Downgrade an already-claimed terminal to "discard" so a parked bridge
-    /// stops holding queued events during shutdown.
-    fn force_discard(&self) {
-        self.state_store_discard();
-    }
-
-    fn state_store_discard(&self) {
-        self.state.store(TERMINAL_DISCARD, Ordering::SeqCst);
-    }
-
     fn release_park(&self) {
         let mut parked = self.parked.lock().unwrap();
         *parked = false;
@@ -246,11 +236,14 @@ impl RequestHandle {
     pub(crate) fn settle(&self, terminal: Terminal, discard: bool) {
         if !self.state.claim(discard) {
             // Someone else already settled. If this is a shutdown and the
-            // bridge is parked behind a consumer's pause, it still has to be
-            // released: a request that completed normally *and* is parked would
-            // otherwise never finish, and free() would wait for it forever.
+            // bridge is parked behind a consumer's pause, release the park so
+            // it can finish — otherwise free() would wait for it forever.
+            //
+            // Release ONLY. Downgrading an already-successful TERMINAL_DRAIN to
+            // discard would throw away the still-queued chunks while the done
+            // channel keeps its success, handing the caller a truncated body
+            // with OnDone(NULL). A hang is bad; silently wrong data is worse.
             if discard {
-                self.state.force_discard();
                 self.state.release_park();
             }
             return;

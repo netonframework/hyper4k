@@ -412,3 +412,79 @@ fn a_paused_request_consumes_its_connection_paused_budget() {
     });
     unsafe { hyper4k_client_free(client) };
 }
+
+#[test]
+fn closing_a_paused_but_already_finished_request_still_delivers_the_whole_body() {
+    // The failure mode this guards: the network side has finished and queued
+    // every chunk, the consumer is parked behind its own pause, and then the
+    // client is closed. Forcing that request to "discard" would drop the
+    // queued chunks while the done channel still carries success — the caller
+    // would see a truncated body with OnDone(NULL) and no way to tell.
+    //
+    // A hang is bad. Silently wrong data is worse.
+    let r = rt();
+    let addr = r.block_on(chunked_server(PARTS));
+    let ctl = Arc::new(Ctl::default());
+    *ctl.plan.lock().unwrap() = vec![Plan::Pause];
+    let client = new_client();
+    let url = format!("http://{addr}/x");
+    let id = start(client, &url, &ctl);
+
+    // Park on chunk 1 and let the network side finish and queue the rest.
+    wait_until("first chunk", || ctl.chunk_count() >= 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctl.chunk_count(), 1, "delivery continued while paused");
+
+    // Close while STILL PARKED. This is the case that matters: the queued
+    // chunks are only reachable if shutdown releases the park without
+    // downgrading the already-successful terminal.
+    let _ = id;
+    unsafe { hyper4k_client_close(client) };
+    wait_until("done", || ctl.done.lock().unwrap().is_some());
+
+    let got = ctl.chunks.lock().unwrap().clone();
+    let outcome = *ctl.done.lock().unwrap();
+    assert_eq!(
+        outcome,
+        Some(-999),
+        "a completed request did not report success"
+    );
+    assert_eq!(
+        got,
+        vec![b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()],
+        "success was reported with a truncated body: queued chunks were dropped"
+    );
+    unsafe { hyper4k_client_free(client) };
+}
+
+#[test]
+fn free_on_a_still_paused_finished_request_keeps_body_and_result_consistent() {
+    // Same shape, but nobody resumes: free() must release the park and the
+    // caller must never see partial body paired with success.
+    let r = rt();
+    let addr = r.block_on(chunked_server(PARTS));
+    let ctl = Arc::new(Ctl::default());
+    *ctl.plan.lock().unwrap() = vec![Plan::Pause];
+    let client = new_client();
+    let url = format!("http://{addr}/x");
+    start(client, &url, &ctl);
+
+    wait_until("first chunk", || ctl.chunk_count() >= 1);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    unsafe { hyper4k_client_free(client) };
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "free() hung on a parked bridge"
+    );
+
+    let delivered = ctl.chunk_count();
+    let outcome = *ctl.done.lock().unwrap();
+    // Whatever the race decides, these two must agree: success means the whole
+    // body was delivered. Partial delivery must not be reported as success.
+    if outcome == Some(-999) {
+        assert_eq!(delivered, 3, "success reported with a truncated body");
+    }
+    assert_eq!(ctl.done_calls.load(Ordering::SeqCst), 1);
+}
