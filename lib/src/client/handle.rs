@@ -31,6 +31,9 @@ pub struct Hyper4kClient {
     connect_timeout: Option<Duration>,
     queue_capacity: usize,
     h2_required: bool,
+    max_retries: u32,
+    request_timeout: Option<Duration>,
+    read_idle_timeout: Option<Duration>,
 }
 
 /// Parsed once at `send`, then reused for every attempt.
@@ -141,6 +144,11 @@ pub unsafe extern "C" fn hyper4k_client_new(
         connect_timeout,
         queue_capacity: 8,
         h2_required: o.flags & HYPER4K_CLIENT_HTTP2_REQUIRED != 0,
+        max_retries: o.max_retries,
+        request_timeout: (o.request_timeout_ms != 0)
+            .then(|| Duration::from_millis(o.request_timeout_ms)),
+        read_idle_timeout: (o.read_idle_timeout_ms != 0)
+            .then(|| Duration::from_millis(o.read_idle_timeout_ms)),
     };
     *out_client = Box::into_raw(Box::new(client));
     HYPER4K_STATUS_OK
@@ -328,8 +336,19 @@ pub unsafe extern "C" fn hyper4k_client_send(
         c.pool.clone()
     };
     let h = handle.clone();
+    // UINT64_MAX inherits, 0 disables, anything else overrides.
+    let idle = match r.read_idle_timeout_ms {
+        u64::MAX => c.read_idle_timeout,
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    };
+    let policy = RequestPolicy {
+        max_retries: c.max_retries,
+        request_timeout: c.request_timeout,
+        read_idle_timeout: idle,
+    };
     let task = rt.spawn(async move {
-        run_request(pool, key, template, sink, h).await;
+        run_request(pool, key, template, sink, h, policy).await;
     });
     handle.set_abort(task.abort_handle());
     HYPER4K_STATUS_OK
@@ -392,58 +411,141 @@ impl Hyper4kClient {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RequestPolicy {
+    pub max_retries: u32,
+    /// Covers every attempt together. Not re-armed per retry: a "total" limit
+    /// that resets is not a limit at all.
+    pub request_timeout: Option<Duration>,
+    /// Inter-chunk idle limit, re-armed on every delivered chunk. This is what
+    /// keeps a long stream alive without an overall deadline.
+    pub read_idle_timeout: Option<Duration>,
+}
+
 async fn run_request(
     pool: Arc<Pool>,
     key: PoolKey,
     template: RequestTemplate,
     sink: bridge::EventSink,
     handle: Arc<RequestHandle>,
+    policy: RequestPolicy,
 ) {
-    let mut lease = match pool.acquire(&key).await {
-        Ok(l) => l,
-        Err(kind) => {
+    let work = attempt_loop(pool, key, template, sink, handle.clone(), policy);
+    match policy.request_timeout {
+        Some(d) => {
+            if tokio::time::timeout(d, work).await.is_err() {
+                handle.settle(
+                    Terminal {
+                        kind: HYPER4K_ERR_TIMEOUT,
+                        protocol_code: 0,
+                        message: "request timeout".into(),
+                    },
+                    true,
+                );
+            }
+        }
+        None => work.await,
+    }
+}
+
+async fn attempt_loop(
+    pool: Arc<Pool>,
+    key: PoolKey,
+    template: RequestTemplate,
+    sink: bridge::EventSink,
+    handle: Arc<RequestHandle>,
+    policy: RequestPolicy,
+) {
+    let idempotent = super::retry::is_idempotent(&template.method);
+    let mut budget = policy.max_retries;
+
+    loop {
+        let mut lease = match pool.acquire(&key).await {
+            Ok(l) => l,
+            Err(kind) => {
+                handle.settle(
+                    Terminal {
+                        kind,
+                        protocol_code: 0,
+                        message: "connect failed".into(),
+                    },
+                    true,
+                );
+                return;
+            }
+        };
+
+        // Task 0 finding: `take_message` reports "hyper had not written it yet",
+        // not "the peer refused it". Handing work to a connection that is
+        // already going away gets it serialised before the GOAWAY is processed,
+        // which downgrades a safely retryable failure to OUTCOME_UNKNOWN.
+        if lease.sender_mut().is_closed() {
+            drop(lease);
+            if budget > 0 {
+                budget -= 1;
+                continue;
+            }
             handle.settle(
                 Terminal {
-                    kind,
+                    kind: HYPER4K_ERR_CONNECT,
                     protocol_code: 0,
-                    message: "connect failed".into(),
+                    message: "no live connection".into(),
                 },
                 true,
             );
             return;
         }
-    };
 
-    let req = template.build();
-    type Sent = Result<
-        hyper::Response<hyper::body::Incoming>,
-        hyper::client::conn::TrySendError<hyper::Request<Full<Bytes>>>,
-    >;
-    let sent: Sent = match lease.sender_mut() {
-        Sender::H1(s) => s.try_send_request(req).await,
-        Sender::H2(s) => s.try_send_request(req).await,
-    };
+        // Every attempt builds a fresh request: try_send_request consumes it,
+        // and on the not-provably-unsent path it is not handed back at all.
+        let req = template.build();
+        type Sent = Result<
+            hyper::Response<hyper::body::Incoming>,
+            hyper::client::conn::TrySendError<hyper::Request<Full<Bytes>>>,
+        >;
+        let sent: Sent = match lease.sender_mut() {
+            Sender::H1(s) => s.try_send_request(req).await,
+            Sender::H2(s) => s.try_send_request(req).await,
+        };
 
-    let response = match sent {
-        Ok(resp) => resp,
-        Err(mut e) => {
-            // `Some` means hyper had not written the request when the failure
-            // surfaced, so it is provably unsent and safe to replay. Task 7
-            // turns that into an actual retry; until then both paths report the
-            // same conservative outcome.
-            let _provably_unsent = e.take_message().is_some();
-            handle.settle(
-                Terminal {
-                    kind: HYPER4K_ERR_OUTCOME_UNKNOWN,
-                    protocol_code: 0,
-                    message: "send failed".into(),
-                },
-                true,
-            );
-            return;
-        }
-    };
+        let response = match sent {
+            Ok(resp) => resp,
+            Err(mut e) => {
+                let provably_unsent = e.take_message().is_some();
+                let committed = handle.state.is_committed();
+                if super::retry::may_retry(committed, provably_unsent, idempotent, budget) {
+                    budget -= 1;
+                    drop(lease);
+                    continue;
+                }
+                let kind = if committed {
+                    HYPER4K_ERR_TRUNCATED
+                } else {
+                    HYPER4K_ERR_OUTCOME_UNKNOWN
+                };
+                handle.settle(
+                    Terminal {
+                        kind,
+                        protocol_code: 0,
+                        message: "send failed".into(),
+                    },
+                    true,
+                );
+                return;
+            }
+        };
 
+        deliver_response(response, &sink, &handle, policy).await;
+        return;
+    }
+}
+
+async fn deliver_response(
+    response: hyper::Response<hyper::body::Incoming>,
+    sink: &bridge::EventSink,
+    handle: &Arc<RequestHandle>,
+    policy: RequestPolicy,
+) {
     let version = match response.version() {
         hyper::Version::HTTP_2 => 2u8,
         _ => 1u8,
@@ -460,6 +562,7 @@ async fn run_request(
         })
         .collect();
 
+    // From here the response is visible to the caller: no replay is possible.
     if !sink
         .send(Event::Headers {
             status,
@@ -473,7 +576,25 @@ async fn run_request(
 
     let mut body = response.into_body();
     loop {
-        match body.frame().await {
+        let next = match policy.read_idle_timeout {
+            Some(d) => match tokio::time::timeout(d, body.frame()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    handle.settle(
+                        Terminal {
+                            kind: HYPER4K_ERR_IDLE_TIMEOUT,
+                            protocol_code: 0,
+                            message: "idle timeout between chunks".into(),
+                        },
+                        true,
+                    );
+                    return;
+                }
+            },
+            None => body.frame().await,
+        };
+
+        match next {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     if !data.is_empty() && !sink.send(Event::Chunk(data)).await {
@@ -482,8 +603,8 @@ async fn run_request(
                 }
             }
             Some(Err(_)) => {
-                // The response had started, so this is truncation, never a
-                // candidate for replay.
+                // The response had started: this is truncation, and truncation
+                // is never a candidate for replay.
                 handle.settle(
                     Terminal {
                         kind: HYPER4K_ERR_TRUNCATED,
@@ -498,7 +619,6 @@ async fn run_request(
         }
     }
 
-    // Normal completion: keep what is queued, then Done.
     handle.settle(
         Terminal {
             kind: HYPER4K_ERR_NONE,

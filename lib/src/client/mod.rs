@@ -7,6 +7,7 @@ pub(crate) mod bridge;
 pub(crate) mod handle;
 pub(crate) mod plaintext;
 pub(crate) mod pool;
+pub(crate) mod retry;
 pub(crate) mod tls;
 
 #[cfg(test)]
@@ -15,6 +16,8 @@ mod backpressure_tests;
 pub(crate) mod handle_tests;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(test)]
+mod retry_tests;
 #[cfg(test)]
 mod tls_tests;
 
