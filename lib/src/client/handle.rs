@@ -33,9 +33,78 @@ pub struct Hyper4kClient {
     queue_capacity: usize,
     h2_required: bool,
     bridges: Arc<bridge::BridgeCounter>,
+    limits: Arc<Limits>,
     max_retries: u32,
     request_timeout: Option<Duration>,
     read_idle_timeout: Option<Duration>,
+}
+
+/// Client-wide ceilings.
+///
+/// Each request's queue is bounded, but nothing bounded the number of requests,
+/// so N of them could still grow without limit. Refusing here is deliberate
+/// throttling and reports `RESOURCE_EXHAUSTED`, which is a different problem
+/// from a real allocation failure and must not be reported as `OOM`.
+pub(crate) struct Limits {
+    max_inflight: u32,
+    max_bytes: u64,
+    inflight: std::sync::atomic::AtomicU32,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Limits {
+    fn new(max_inflight: u32, max_bytes: u64) -> Self {
+        Limits {
+            max_inflight: if max_inflight == 0 {
+                super::DEFAULT_MAX_INFLIGHT
+            } else {
+                max_inflight
+            },
+            max_bytes: if max_bytes == 0 {
+                super::DEFAULT_MAX_BUFFERED_BYTES
+            } else {
+                max_bytes
+            },
+            inflight: std::sync::atomic::AtomicU32::new(0),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Reserve room for one request, or refuse. Reservation and release are
+    /// paired through `Reservation`'s Drop so no exit path can leak either.
+    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
+        let n = self.inflight.fetch_add(1, Ordering::SeqCst);
+        if n >= self.max_inflight {
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        let b = self.bytes.fetch_add(bytes, Ordering::SeqCst);
+        if b + bytes > self.max_bytes {
+            self.bytes.fetch_sub(bytes, Ordering::SeqCst);
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Reservation {
+            limits: self.clone(),
+            bytes,
+        })
+    }
+
+    pub(crate) fn inflight(&self) -> u32 {
+        self.inflight.load(Ordering::SeqCst)
+    }
+}
+
+pub(crate) struct Reservation {
+    limits: Arc<Limits>,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.limits.bytes.fetch_sub(self.bytes, Ordering::SeqCst);
+        self.limits.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Parsed once at `send`, then reused for every attempt.
@@ -174,6 +243,7 @@ pub unsafe extern "C" fn hyper4k_client_new(
         queue_capacity: 8,
         h2_required: o.flags & HYPER4K_CLIENT_HTTP2_REQUIRED != 0,
         bridges: Arc::new(bridge::BridgeCounter::default()),
+        limits: Arc::new(Limits::new(o.max_inflight_requests, o.max_buffered_bytes)),
         max_retries: o.max_retries,
         request_timeout: (o.request_timeout_ms != 0)
             .then(|| Duration::from_millis(o.request_timeout_ms)),
@@ -371,11 +441,22 @@ pub unsafe extern "C" fn hyper4k_client_send(
     let key = PoolKey::new(&scheme, &host, port);
     let id = c.next_id.fetch_add(1, Ordering::SeqCst);
 
+    // Queue capacity is per request; this is the ceiling across all of them.
+    let queue_budget = (c.queue_capacity as u64) * 64 * 1024;
+    let Some(reservation) = c
+        .limits
+        .try_reserve(template.body.len() as u64 + queue_budget)
+    else {
+        return HYPER4K_STATUS_RESOURCE_EXHAUSTED;
+    };
+
     let requests = c.requests.clone();
     let bridges = c.bridges.clone();
     bridges.enter();
     let cleanup_id = id;
     let cleanup = move || {
+        // Held until the request is fully done, then released by Drop.
+        drop(reservation);
         requests.remove(&cleanup_id);
         // After OnDone has returned: only now may free() proceed.
         bridges.leave();
@@ -434,6 +515,18 @@ pub unsafe extern "C" fn hyper4k_client_resume(
         return HYPER4K_STATUS_NOT_FOUND;
     };
     h.state.resume()
+}
+
+/// Requests currently in flight. Diagnostics only.
+///
+/// # Safety
+/// `client` must be a live client.
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_client_inflight_count(client: *mut Hyper4kClient) -> u32 {
+    if client.is_null() {
+        return 0;
+    }
+    (*client).limits.inflight()
 }
 
 /// Total parked streams across every pooled connection.

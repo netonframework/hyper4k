@@ -669,3 +669,68 @@ fn free_waits_for_a_slow_callback_instead_of_racing_it() {
         "free() returned while a callback was still running"
     );
 }
+
+#[test]
+fn exceeding_the_inflight_ceiling_reports_resource_exhausted() {
+    // Deliberate throttling, not an allocator failure: reporting OOM here would
+    // send an operator hunting for a memory leak that does not exist.
+    let r = rt();
+    let addr = r.block_on(silent_server()); // holds every request open
+    let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_options_init(&mut o, std::mem::size_of::<Hyper4kClientOptions>() as u32)
+    };
+    o.max_inflight_requests = 2;
+    let mut client = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { hyper4k_client_new(&o, &mut client) },
+        HYPER4K_STATUS_OK
+    );
+
+    let url = format!("http://{addr}/slow");
+    let caps: Vec<Arc<Capture>> = (0..2).map(|_| Arc::new(Capture::default())).collect();
+    for cap in &caps {
+        let (st, _) = send(client, &url, cap, Some(on_chunk));
+        assert_eq!(st, HYPER4K_STATUS_OK);
+    }
+    wait_until(|| unsafe { hyper4k_client_inflight_count(client) } == 2);
+
+    let extra = Arc::new(Capture::default());
+    let (st, _) = send(client, &url, &extra, Some(on_chunk));
+    assert_eq!(
+        st, HYPER4K_STATUS_RESOURCE_EXHAUSTED,
+        "the inflight ceiling did not hold"
+    );
+    assert_ne!(st, HYPER4K_STATUS_OOM, "throttling must not look like OOM");
+    assert!(extra.done.lock().unwrap().is_none());
+
+    unsafe { hyper4k_client_free(client) };
+}
+
+#[test]
+fn a_finished_request_returns_its_reservation() {
+    // Without release-on-drop the ceiling would ratchet down until every
+    // request is refused.
+    let r = rt();
+    let addr = r.block_on(echo_server(b"pong"));
+    let mut o: Hyper4kClientOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        hyper4k_client_options_init(&mut o, std::mem::size_of::<Hyper4kClientOptions>() as u32)
+    };
+    o.max_inflight_requests = 1;
+    let mut client = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { hyper4k_client_new(&o, &mut client) },
+        HYPER4K_STATUS_OK
+    );
+
+    let url = format!("http://{addr}/ping");
+    for _ in 0..5 {
+        let cap = Arc::new(Capture::default());
+        let (st, _) = send(client, &url, &cap, Some(on_chunk));
+        assert_eq!(st, HYPER4K_STATUS_OK, "a reservation was not returned");
+        wait_until(|| cap.done.lock().unwrap().is_some());
+        wait_until(|| unsafe { hyper4k_client_inflight_count(client) } == 0);
+    }
+    unsafe { hyper4k_client_free(client) };
+}

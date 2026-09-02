@@ -164,6 +164,17 @@ pub(crate) trait Connector: Send + Sync + 'static {
     fn connect(&self, key: &PoolKey) -> ConnectFuture;
 }
 
+/// Per-authority connection cap. Enough for a busy h1 caller without letting a
+/// burst open an unbounded number of sockets.
+pub(crate) const DEFAULT_MAX_CONNS_PER_KEY: u32 = 8;
+
+/// Paused streams allowed on one h2 connection.
+///
+/// The reservation invariant: the connection window must stay above
+/// (this cap x max per-stream occupancy) + the reserve the active streams need,
+/// or parked streams would starve the live ones sharing that connection.
+pub(crate) const DEFAULT_PAUSED_CAP: u32 = 4;
+
 pub(crate) struct Pool {
     connector: Arc<dyn Connector>,
     conns: DashMap<PoolKey, Vec<Arc<ConnEntry>>>,
@@ -174,6 +185,9 @@ pub(crate) struct Pool {
     max_conns_per_key: u32,
     paused_cap: u32,
     closed: AtomicBool,
+    shutting_down: AtomicBool,
+    shutdown_complete: AtomicBool,
+    shutdown_done: tokio::sync::Notify,
 }
 
 impl Pool {
@@ -183,12 +197,15 @@ impl Pool {
             conns: DashMap::new(),
             dial_locks: DashMap::new(),
             next_id: AtomicU64::new(1),
-            max_conns_per_key: 8,
+            max_conns_per_key: DEFAULT_MAX_CONNS_PER_KEY,
             // Reservation invariant: connection window must exceed
             // (paused cap x max stream occupancy) + the active reserve, so
             // paused streams can never starve the live ones on that connection.
-            paused_cap: 4,
+            paused_cap: DEFAULT_PAUSED_CAP,
             closed: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
+            shutdown_done: tokio::sync::Notify::new(),
         }
     }
 
@@ -298,6 +315,24 @@ impl Pool {
     /// A driver that outlives shutdown would keep `hyper4k_client_free` blocked
     /// forever, so this must be exhaustive.
     pub(crate) async fn shutdown(&self) {
+        // Single-flight: close() kicks one off and free() runs another, so
+        // without this both would walk and clear the same map concurrently.
+        // Whoever loses simply waits for the winner to finish.
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            // Notify has no memory of past signals, so re-check the flag with
+            // the waiter already registered. Awaiting first would hang forever
+            // whenever the winner finished before we got here.
+            loop {
+                if self.shutdown_complete.load(Ordering::SeqCst) {
+                    return;
+                }
+                let waiter = self.shutdown_done.notified();
+                if self.shutdown_complete.load(Ordering::SeqCst) {
+                    return;
+                }
+                waiter.await;
+            }
+        }
         self.closed.store(true, Ordering::SeqCst);
         let mut handles = Vec::new();
         for mut list in self.conns.iter_mut() {
@@ -313,6 +348,10 @@ impl Pool {
             h.abort();
             let _ = h.await;
         }
+        // Flag first, then wake: a waiter that registered after this point
+        // still sees the flag and returns without awaiting.
+        self.shutdown_complete.store(true, Ordering::SeqCst);
+        self.shutdown_done.notify_waiters();
     }
 
     // --- test observability -------------------------------------------------

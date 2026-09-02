@@ -38,6 +38,12 @@ pub const HYPER4K_CLIENT_HTTP2_REQUIRED: u64 = 1 << 0;
 /// them. Replacing the root set is not certificate pinning; v4 has no pinning.
 pub const HYPER4K_CLIENT_CA_REPLACE_SYSTEM: u64 = 1 << 1;
 
+/// Defaults for the client-level ceilings. They exist so that exhausting them
+/// is a reported `RESOURCE_EXHAUSTED`, not an out-of-memory kill: per-request
+/// queues are each bounded, but N of them are not.
+pub const DEFAULT_MAX_INFLIGHT: u32 = 1024;
+pub const DEFAULT_MAX_BUFFERED_BYTES: u64 = 64 * 1024 * 1024;
+
 pub const KNOWN_CLIENT_FLAGS: u64 =
     HYPER4K_CLIENT_HTTP2_REQUIRED | HYPER4K_CLIENT_CA_REPLACE_SYSTEM;
 
@@ -59,7 +65,11 @@ pub struct Hyper4kClientOptions {
     pub read_idle_timeout_ms: u64,
     /// *Additional* attempts: 0 means try once, 2 means at most three tries.
     pub max_retries: u32,
-    pub _reserved: u32,
+    /// Ceiling on requests in flight at once. 0 uses the built-in default.
+    pub max_inflight_requests: u32,
+    /// Ceiling on bytes held across every request's queue plus their request
+    /// bodies. 0 uses the built-in default.
+    pub max_buffered_bytes: u64,
     /// NULL uses the platform roots only.
     pub custom_ca_pem: *const u8,
     pub custom_ca_pem_len: usize,
@@ -133,7 +143,8 @@ pub unsafe extern "C" fn hyper4k_client_options_init(
         request_timeout_ms: 60_000,
         read_idle_timeout_ms: 60_000,
         max_retries: 2,
-        _reserved: 0,
+        max_inflight_requests: DEFAULT_MAX_INFLIGHT,
+        max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
         custom_ca_pem: std::ptr::null(),
         custom_ca_pem_len: 0,
     };

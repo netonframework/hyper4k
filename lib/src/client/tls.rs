@@ -16,6 +16,20 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+/// Per-stream flow-control window.
+pub(crate) const STREAM_WINDOW: u32 = 1024 * 1024;
+
+/// Connection window, sized from the reservation invariant in spec §2.5:
+///
+///   connection window >= (paused cap x stream window) + active reserve
+///
+/// With a paused cap of 4 and a 1 MiB stream window that is 4 MiB of possible
+/// parked occupancy, plus 4 MiB of headroom the live streams keep regardless.
+pub(crate) const CONNECTION_WINDOW: u32 =
+    super::pool::DEFAULT_PAUSED_CAP * STREAM_WINDOW + 4 * 1024 * 1024;
+
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 128;
+
 pub(crate) struct TlsOptions {
     pub custom_ca_pem: Option<Vec<u8>>,
     pub replace_system_roots: bool,
@@ -187,10 +201,17 @@ impl Connector for TlsClientConnector {
 
             let io = TokioIo::new(tls);
             if negotiated_h2 {
-                let (sender, conn) =
-                    http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), io)
-                        .await
-                        .map_err(|_| HYPER4K_ERR_PROTOCOL)?;
+                // Size the windows here rather than accepting hyper's defaults:
+                // the reservation invariant needs a connection window large
+                // enough that the allowed number of paused streams cannot
+                // consume the headroom the active streams rely on.
+                let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+                    .initial_stream_window_size(STREAM_WINDOW)
+                    .initial_connection_window_size(CONNECTION_WINDOW)
+                    .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                    .handshake::<_, Full<Bytes>>(io)
+                    .await
+                    .map_err(|_| HYPER4K_ERR_PROTOCOL)?;
                 let driver = tokio::spawn(async move {
                     let _ = conn.await;
                 });
