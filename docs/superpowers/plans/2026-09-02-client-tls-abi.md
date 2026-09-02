@@ -636,8 +636,9 @@ tested there, against the real thing. Verifying ALPN against a stub would prove
 nothing about ALPN.
 
 **Interfaces:**
-- Consumes: `Hyper4kStatus` (Task 1), TLS config builder (Task 4 provides the real
-  one; this task takes a `Fn() -> ClientConfig` so it can be tested with a stub).
+- Consumes: `Hyper4kStatus` (Task 1). **No TLS dependency** — the pool takes a
+  `Connector` trait object, and this task only supplies the plaintext h1 one. Task 5
+  injects the TLS connector.
 - Produces:
   `pub(crate) struct PoolKey { scheme: Scheme, host: String, port: u16 }`;
   `pub(crate) enum Sender { H1(http1::SendRequest<Full<Bytes>>), H2(http2::SendRequest<Full<Bytes>>) }`;
@@ -680,19 +681,27 @@ Frozen model:
 
 - [ ] **Step 1: Write the failing test**
 
+Two groups. Real sockets are **plaintext h1 only** — production must never pick H2
+from an `http://` URL, because spec §2.1 says v4 ships no h2c client. H2 multiplexing
+and the capacity counters are exercised through an injected fake connector, so the
+pool logic is covered without smuggling in a plaintext H2 handshake. Real H2 arrives
+in Task 5 over TLS with ALPN.
+
 ```rust
 #[cfg(test)]
 mod pool_tests {
     use super::*;
 
+    // ---- real sockets, plaintext, h1 only -------------------------------
+
     #[tokio::test]
-    async fn h2_requests_to_one_authority_share_a_connection() {
-        let peer = spawn_h2_server().await;
+    async fn plaintext_urls_always_yield_an_h1_sender() {
+        // The guard against accidentally shipping an h2c client.
+        let peer = spawn_h1_server().await;
         let pool = Pool::new(plaintext_only());
-        let key = key_for(&peer);
-        let a = pool.acquire(&key).await.unwrap();
-        let b = pool.acquire(&key).await.unwrap();
-        assert_eq!(a.conn_id, b.conn_id, "h2 must multiplex, not redial");
+        let lease = pool.acquire(&key_for(&peer)).await.unwrap();
+        assert!(matches!(lease.sender, Sender::H1(_)),
+                "http:// must not negotiate H2 in v4");
     }
 
     #[tokio::test]
@@ -720,7 +729,7 @@ mod pool_tests {
 
     #[tokio::test]
     async fn concurrent_acquires_dial_once() {
-        let peer = spawn_h2_server_counting_accepts().await;
+        let peer = spawn_h1_server_counting_accepts().await;
         let pool = Pool::new(plaintext_only());
         let key = key_for(&peer);
         let leases = futures::future::join_all(
@@ -731,22 +740,22 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn a_closed_connection_is_evicted_on_release() {
-        let peer = spawn_h2_server().await;
+    async fn a_closed_connection_is_evicted_when_the_lease_drops() {
+        let peer = spawn_h1_server().await;
         let pool = Pool::new(plaintext_only());
         let key = key_for(&peer);
         let lease = pool.acquire(&key).await.unwrap();
+        let old = lease.conn_id;
         peer.drop_all_connections();
         wait_until_async(|| lease.sender.is_closed()).await;
-        let old = lease.conn_id;
-        pool.release(lease);
+        drop(lease);                          // RAII: there is no pool.release()
         let fresh = pool.acquire(&key).await.unwrap();
         assert_ne!(fresh.conn_id, old, "a dead connection was handed out again");
     }
 
     #[tokio::test]
     async fn shutdown_joins_every_connection_driver() {
-        let peer = spawn_h2_server().await;
+        let peer = spawn_h1_server().await;
         let pool = Pool::new(plaintext_only());
         let _lease = pool.acquire(&key_for(&peer)).await.unwrap();
         // If a driver task outlives shutdown, hyper4k_client_free would hang.
@@ -755,11 +764,21 @@ mod pool_tests {
             .expect("shutdown did not join its drivers");
     }
 
+    // ---- fake connector: H2 bookkeeping without an h2c handshake ---------
+
+    #[tokio::test]
+    async fn h2_leases_to_one_authority_share_a_connection() {
+        let pool = Pool::new(fake_h2_connector());
+        let key = fake_key();
+        let a = pool.acquire(&key).await.unwrap();
+        let b = pool.acquire(&key).await.unwrap();
+        assert_eq!(a.conn_id, b.conn_id, "h2 must multiplex, not redial");
+    }
+
     #[tokio::test]
     async fn an_h2_connection_at_the_paused_cap_stops_taking_new_streams() {
-        let peer = spawn_h2_server().await;
-        let pool = Pool::new(plaintext_only()).with_paused_cap(2);
-        let key = key_for(&peer);
+        let pool = Pool::new(fake_h2_connector()).with_paused_cap(2);
+        let key = fake_key();
         let a = pool.acquire(&key).await.unwrap();
         let _g1 = PauseGuard::new(a.entry.clone());
         let _g2 = PauseGuard::new(a.entry.clone());
@@ -770,25 +789,27 @@ mod pool_tests {
 
     #[tokio::test]
     async fn dropping_a_pause_guard_restores_capacity() {
-        let peer = spawn_h2_server().await;
-        let pool = Pool::new(plaintext_only()).with_paused_cap(1);
-        let key = key_for(&peer);
+        let pool = Pool::new(fake_h2_connector()).with_paused_cap(1);
+        let key = fake_key();
         let a = pool.acquire(&key).await.unwrap();
         {
             let _g = PauseGuard::new(a.entry.clone());
             let other = pool.acquire(&key).await.unwrap();
             assert_ne!(other.conn_id, a.conn_id);
         }
-        let back = pool.acquire(&key).await.unwrap();
-        assert_eq!(back.conn_id, a.conn_id, "paused count leaked after drop");
+        // Assert the accounting, not which connection gets picked next —
+        // choosing a different live connection is also legal.
+        assert_eq!(a.entry.paused_count(), 0, "paused count leaked after drop");
+        assert!(pool.eligible_connections(&key).contains(&a.conn_id),
+                "the unpaused connection did not return to the eligible set");
+        assert_eq!(pool.connection_count(&key), 2, "an extra connection was dialled");
     }
 
     #[tokio::test]
     async fn capacity_survives_cancel_timeout_and_connection_error() {
         // Every abnormal exit unwinds through Drop; none may leak a slot.
-        let peer = spawn_h2_server().await;
-        let pool = Pool::new(plaintext_only());
-        let key = key_for(&peer);
+        let pool = Pool::new(fake_h2_connector());
+        let key = fake_key();
         let before = pool.active_count(&key);
         for scenario in [Abort::Cancel, Abort::Timeout, Abort::ConnError] {
             let lease = pool.acquire(&key).await.unwrap();
@@ -808,15 +829,16 @@ Expected: FAIL — `Pool` not found
 - [ ] **Step 3: Implement the pool**
 
 Follow the frozen model above. `acquire` looks up the key, reuses a live h2 lease
-below its stream and paused caps, otherwise joins or starts a dial. A dial performs
-TCP connect, optional TLS, then `http2::handshake` or `http1::handshake` based on
-the negotiated ALPN protocol, spawns the connection driver and stores its
-`JoinHandle`.
+below its stream and paused caps, otherwise joins or starts a dial. A dial delegates to the injected `Connector`. The plaintext connector added here
+does TCP connect then `http1::handshake` — **never** `http2::handshake`, because an
+`http://` URL must not produce an H2 connection in v4. The TLS connector in Task 5
+picks the handshake from the negotiated ALPN protocol. Either way the pool spawns
+the connection driver and stores its `JoinHandle`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd lib && cargo test --lib client::pool_tests`
-Expected: PASS, 9 tests
+Expected: PASS, 10 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1753,5 +1775,5 @@ expected pass/fail string.
 **Type consistency.** `Hyper4kStatus`, `Hyper4kErrorKind`, `Hyper4kHeadersAction`,
 `Hyper4kChunkAction` are declared in Task 1 and used unchanged in Tasks 2–6.
 `Hyper4kClientOptions` and `Hyper4kClientRequest` are declared once in Task 2 and
-consumed by name thereafter. `hyper4k_client_resume` appears only in Task 5, where
+consumed by name thereafter. `hyper4k_client_resume` appears only in Task 6, where
 it is defined.
