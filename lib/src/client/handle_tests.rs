@@ -193,6 +193,37 @@ async fn echo_server(body: &'static [u8]) -> SocketAddr {
     addr
 }
 
+/// Records the raw request head of the first request and answers 200.
+///
+/// hyper's server normalises the target before a handler sees it, so only a
+/// raw socket can tell origin-form from absolute-form.
+async fn head_capturing_server(head: Arc<Mutex<String>>) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        while let Ok(n) = sock.read(&mut tmp).await {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        *head.lock().unwrap() = String::from_utf8_lossy(&buf).into_owned();
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+    });
+    addr
+}
+
 /// Accepts, then never answers. Used to hold a request in flight.
 async fn silent_server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -235,6 +266,32 @@ fn plaintext_get_delivers_headers_body_and_done_once() {
         cap.events_after_done.load(Ordering::SeqCst),
         0,
         "event after OnDone"
+    );
+    unsafe { hyper4k_client_free(client) };
+}
+
+#[test]
+fn http1_request_target_is_origin_form_with_a_host_header() {
+    // RFC 9112 §3.2.1: a direct HTTP/1.1 request carries "/path?q", not the
+    // full URL. The low-level conn API sends the URI verbatim, and hyper's own
+    // server accepts absolute-form, so this only shows up against a peer that
+    // looks at the bytes. Real origins reject or misroute absolute-form.
+    let r = rt();
+    let head = Arc::new(Mutex::new(String::new()));
+    let addr = r.block_on(head_capturing_server(head.clone()));
+    let cap = Arc::new(Capture::default());
+    let client = new_client(0);
+    let (st, _) = send(client, &format!("http://{addr}/path?q=1"), &cap, Some(on_chunk));
+    assert_eq!(st, HYPER4K_STATUS_OK);
+    wait_until(|| cap.done.lock().unwrap().is_some());
+    assert_eq!(*cap.done.lock().unwrap(), Some(-999));
+
+    let head = head.lock().unwrap().clone();
+    let request_line = head.lines().next().unwrap_or("").to_owned();
+    assert_eq!(request_line, "GET /path?q=1 HTTP/1.1", "full head:\n{head}");
+    assert!(
+        head.lines().any(|l| l.to_ascii_lowercase().starts_with(&format!("host: {addr}"))),
+        "Host header missing or wrong:\n{head}"
     );
     unsafe { hyper4k_client_free(client) };
 }

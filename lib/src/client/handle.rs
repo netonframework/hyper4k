@@ -161,6 +161,19 @@ impl RequestTemplate {
     }
 }
 
+/// Rewrites the request-target to origin-form for HTTP/1.1 (RFC 9112 §3.2.1).
+fn to_origin_form(mut req: hyper::Request<Full<Bytes>>) -> hyper::Request<Full<Bytes>> {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    if let Ok(uri) = hyper::Uri::try_from(path_and_query) {
+        *req.uri_mut() = uri;
+    }
+    req
+}
+
 unsafe fn slice_bytes(s: &crate::Hyper4kSlice) -> Option<Bytes> {
     if s.len == 0 {
         return Some(Bytes::new());
@@ -703,7 +716,13 @@ async fn attempt_loop(
             hyper::client::conn::TrySendError<hyper::Request<Full<Bytes>>>,
         >;
         let sent: Sent = match lease.sender_mut() {
-            Sender::H1(s) => s.try_send_request(req).await,
+            // The low-level conn API writes the URI verbatim. HTTP/1.1 on a
+            // direct connection must use origin-form ("/path?q"); absolute-form
+            // is for proxies. hyper's high-level Client does this rewrite for
+            // you, and skipping it here was invisible against hyper's own server,
+            // which accepts either. HTTP/2 keeps the full URI: the :scheme and
+            // :authority pseudo-headers are derived from it.
+            Sender::H1(s) => s.try_send_request(to_origin_form(req)).await,
             Sender::H2(s) => s.try_send_request(req).await,
         };
 

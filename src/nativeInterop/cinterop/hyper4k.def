@@ -15,3 +15,11 @@ headerFilter = hyper4k.h
 #   macosArm64   -> target/aarch64-apple-darwin/release
 #   ...
 staticLibraries = libhyper4k.a
+
+# 链接选项必须写在这里而不是只写在 build.gradle.kts 的 binaries.all 里：
+# 后者只作用于本项目产出的二进制，不会随 klib 传给使用方。使用方一旦引用了
+# hyper4k_client_new（rustls-native-certs 会拉进 Security.framework 的符号），
+# 缺了这些就在使用方那边链接失败，而 hyper4k 自己的测试全绿。
+linkerOpts.osx = -framework Security -framework CoreFoundation
+linkerOpts.linux = -lpthread -ldl -lm
+linkerOpts.mingw = -lws2_32 -luserenv -lntdll -lbcrypt

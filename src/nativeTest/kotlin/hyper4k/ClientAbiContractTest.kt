@@ -1,6 +1,8 @@
 package hyper4k
 
 import hyper4k.cinterop.*
+import hyper4k.cinterop.Hyper4kClientOptions as COptions
+import hyper4k.cinterop.Hyper4kClientRequest as CRequest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -47,10 +49,10 @@ class ClientAbiContractTest {
         }
 
         memScoped {
-            val opts = alloc<Hyper4kClientOptions>()
+            val opts = alloc<COptions>()
             val st = hyper4k_client_options_init(
                 opts.ptr,
-                sizeOf<Hyper4kClientOptions>().toUInt(),
+                sizeOf<COptions>().toUInt(),
             )
             assertEquals(HYPER4K_STATUS_OK, st)
 
@@ -60,10 +62,10 @@ class ClientAbiContractTest {
 
             val url = "http://127.0.0.1:$port/hello"
             val method = "GET"
-            val req = alloc<Hyper4kClientRequest>()
+            val req = alloc<CRequest>()
             assertEquals(
                 HYPER4K_STATUS_OK,
-                hyper4k_client_request_init(req.ptr, sizeOf<Hyper4kClientRequest>().toUInt()),
+                hyper4k_client_request_init(req.ptr, sizeOf<CRequest>().toUInt()),
             )
             method.encodeToByteArray().usePinned { m ->
                 url.encodeToByteArray().usePinned { u ->
@@ -103,15 +105,15 @@ class ClientAbiContractTest {
     fun sendAfterCloseIsRefusedWithoutAnyCallback() {
         Sink.reset()
         memScoped {
-            val opts = alloc<Hyper4kClientOptions>()
-            hyper4k_client_options_init(opts.ptr, sizeOf<Hyper4kClientOptions>().toUInt())
+            val opts = alloc<COptions>()
+            hyper4k_client_options_init(opts.ptr, sizeOf<COptions>().toUInt())
             val clientRef = alloc<CPointerVar<cnames.structs.Hyper4kClient>>()
             hyper4k_client_new(opts.ptr, clientRef.ptr)
             val client = clientRef.value!!
             hyper4k_client_close(client)
 
-            val req = alloc<Hyper4kClientRequest>()
-            hyper4k_client_request_init(req.ptr, sizeOf<Hyper4kClientRequest>().toUInt())
+            val req = alloc<CRequest>()
+            hyper4k_client_request_init(req.ptr, sizeOf<CRequest>().toUInt())
             val url = "http://127.0.0.1:1/x"
             val method = "GET"
             method.encodeToByteArray().usePinned { m ->
