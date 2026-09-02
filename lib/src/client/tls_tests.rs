@@ -6,7 +6,7 @@
 //! signed peer and lives in the ignored public test instead.
 
 use super::handle::*;
-use super::handle_tests::{new_client_with_ca, send_and_wait, Capture};
+use super::handle_tests::{new_client_with_ca, send_and_wait};
 use super::tls::{build_tls_config, TlsOptions};
 use super::*;
 use crate::abi::*;

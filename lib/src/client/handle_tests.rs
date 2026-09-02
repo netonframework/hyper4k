@@ -1,6 +1,6 @@
 //! Lifecycle, callback-ordering and terminal-gate tests.
 
-use super::bridge::{OnChunk, OnDone, OnHeaders};
+use super::bridge::OnChunk;
 use super::handle::*;
 use super::*;
 use crate::abi::*;

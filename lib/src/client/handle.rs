@@ -33,6 +33,9 @@ pub struct Hyper4kClient {
     queue_capacity: usize,
     h2_required: bool,
     bridges: Arc<bridge::BridgeCounter>,
+    /// Fixed thread count: callbacks never run on an I/O worker, and a paused
+    /// request occupies none of these.
+    executor: Arc<super::executor::BridgeExecutor>,
     limits: Arc<Limits>,
     max_retries: u32,
     request_timeout: Option<Duration>,
@@ -243,6 +246,11 @@ pub unsafe extern "C" fn hyper4k_client_new(
         queue_capacity: 8,
         h2_required: o.flags & HYPER4K_CLIENT_HTTP2_REQUIRED != 0,
         bridges: Arc::new(bridge::BridgeCounter::default()),
+        executor: super::executor::BridgeExecutor::new(
+            std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4),
+        ),
         limits: Arc::new(Limits::new(o.max_inflight_requests, o.max_buffered_bytes)),
         max_retries: o.max_retries,
         request_timeout: (o.request_timeout_ms != 0)
@@ -321,6 +329,7 @@ pub unsafe extern "C" fn hyper4k_client_free(client: *mut Hyper4kClient) {
         });
     }
     drop(boxed.runtime.take());
+    boxed.executor.shutdown();
 }
 
 /// Submit a request.
@@ -458,12 +467,12 @@ pub unsafe extern "C" fn hyper4k_client_send(
         // Held until the request is fully done, then released by Drop.
         drop(reservation);
         requests.remove(&cleanup_id);
-        // After OnDone has returned: only now may free() proceed.
-        bridges.leave();
     };
+    let _ = &bridges;
     let rt = c.runtime.as_ref().expect("runtime present until free");
-    let (handle, sink, _worker) = bridge::spawn(
-        rt.handle(),
+    let (handle, sink) = bridge::spawn(
+        &c.executor,
+        &c.bridges,
         id,
         Callbacks {
             on_headers,
@@ -514,7 +523,7 @@ pub unsafe extern "C" fn hyper4k_client_resume(
     let Some(h) = c.requests.get(&request_id) else {
         return HYPER4K_STATUS_NOT_FOUND;
     };
-    h.state.resume()
+    h.resume()
 }
 
 /// Requests currently in flight. Diagnostics only.

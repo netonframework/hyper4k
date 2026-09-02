@@ -4,7 +4,7 @@
 //! to the wire.
 
 use super::handle::*;
-use super::handle_tests::{new_client_with_ca, Capture};
+use super::handle_tests::Capture;
 use super::*;
 use crate::abi::*;
 use std::ffi::c_void;

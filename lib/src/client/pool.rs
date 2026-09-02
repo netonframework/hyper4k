@@ -70,14 +70,12 @@ pub struct ConnEntry {
 }
 
 impl ConnEntry {
+    #[cfg(test)]
     pub(crate) fn active_count(&self) -> u32 {
         self.active.load(Ordering::SeqCst)
     }
     pub(crate) fn paused_count(&self) -> u32 {
         self.paused.load(Ordering::SeqCst)
-    }
-    fn is_h2(&self) -> bool {
-        matches!(self.slot, Slot::H2(_))
     }
     fn closed(&self) -> bool {
         if self.dead.load(Ordering::SeqCst) {
@@ -102,6 +100,9 @@ impl ConnEntry {
 /// A pool that leaks capacity eventually believes every connection is full.
 pub(crate) struct Lease {
     pub(crate) sender: Option<Sender>,
+    /// Stable identity of the connection behind this lease. Tests assert reuse
+    /// and eviction through it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) conn_id: u64,
     pub(crate) entry: Arc<ConnEntry>,
 }
@@ -209,11 +210,13 @@ impl Pool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_max_connections_per_key(mut self, n: u32) -> Self {
         self.max_conns_per_key = n;
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_paused_cap(mut self, n: u32) -> Self {
         self.paused_cap = n;
         self
@@ -355,6 +358,10 @@ impl Pool {
     }
 
     // --- test observability -------------------------------------------------
+    //
+    // Only tests call these. They stay because they are the only way to assert
+    // the pool's invariants from outside; deleting them would leave the
+    // reservation and reuse rules unobservable.
 
     pub(crate) fn total_paused(&self) -> u32 {
         self.conns
@@ -363,10 +370,12 @@ impl Pool {
             .sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn connection_count(&self, key: &PoolKey) -> usize {
         self.conns.get(key).map(|l| l.len()).unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_count(&self, key: &PoolKey) -> u32 {
         self.conns
             .get(key)
@@ -374,6 +383,7 @@ impl Pool {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub(crate) fn eligible_connections(&self, key: &PoolKey) -> Vec<u64> {
         self.conns
             .get(key)
@@ -384,12 +394,5 @@ impl Pool {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    pub(crate) fn is_h2(&self, key: &PoolKey) -> bool {
-        self.conns
-            .get(key)
-            .map(|l| l.iter().any(|e| e.is_h2()))
-            .unwrap_or(false)
     }
 }

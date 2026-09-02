@@ -112,7 +112,7 @@ pub struct Hyper4kError {
 // ---------------------------------------------------------------------------
 
 /// `(major << 16) | minor`. A major change means incompatible.
-const ABI_VERSION: u32 = (4 << 16) | 0;
+const ABI_VERSION: u32 = 4 << 16; // major 4, minor 0
 
 const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
@@ -166,7 +166,9 @@ mod tests {
 
     #[test]
     fn abi_version_is_four_zero() {
-        assert_eq!(hyper4k_abi_version(), (4u32 << 16) | 0u32);
+        // Spelled out rather than reusing ABI_VERSION: this pins the value a
+        // Kotlin or C consumer will hold, not our own expression for it.
+        assert_eq!(hyper4k_abi_version(), 0x0004_0000);
     }
 
     #[test]
