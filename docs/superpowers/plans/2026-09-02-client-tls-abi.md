@@ -163,12 +163,42 @@ Write the outcome into this plan under Task 7 as a table, recording **the exact
 hyper version tested** (`cargo tree -p hyper | head -1`) and the result of each of
 the four probes:
 
-| probe | expected | observed | hyper version |
+**Result, 2026-09-02, hyper v1.11.1 — all four probes pass.**
+
+| probe | expected | observed | verdict |
 |---|---|---|---|
-| GOAWAY-excluded stream | `Some` | | |
-| already serialised | `None` | | |
-| h1 stale pooled connection | `Some` | | |
-| committed then died | not replayable | | |
+| GOAWAY-excluded stream (`last_stream_id = 0`) | `Some` | `take_message = true` | as expected |
+| already serialised, peer drops | `None` | `take_message = false` | as expected |
+| h1 stale pooled connection | `Some` | `take_message = true` | as expected |
+| committed then died | not replayable | never reaches `TrySendError` at all | stronger than expected |
+
+h1 and h2 **agree**, so Task 7 needs no per-protocol branch.
+
+Two findings that change how Task 7 is written:
+
+1. **`take_message()` is time-sensitive, and the first version of probe 1 failed
+   because of it.** Sending immediately after the handshake returned
+   `take_message = false` even though the peer had already sent
+   `GOAWAY(last_stream_id = 0)`: hyper had serialised the request before it
+   processed the GOAWAY. After a 200 ms pause — long enough for the GOAWAY to be
+   handled, at which point `sender.is_closed() == true` — the same request came
+   back as `Some`.
+
+   So `provably_unsent` is **not** "the peer refused this"; it is "hyper had not
+   yet written it when the failure surfaced". That is still exactly the safety
+   property spec §四 needs — it is conservative in the right direction, never
+   claiming unsent when it might have been sent — but it means **a retry can also
+   legitimately fail to be offered**, and the code must not treat `None` as
+   anomalous. Task 7 must additionally consult `SendRequest::is_closed()` before
+   handing a pooled connection to a request, or it will keep serialising onto
+   connections that are already going away and turn safely-retryable failures into
+   `OUTCOME_UNKNOWN`.
+
+2. **The committed case never produces a `TrySendError`.** Once headers arrive,
+   `try_send_request` has already returned `Ok(response)` and the truncation
+   surfaces as an error on the body stream. There is no `take_message` to consult,
+   so `response_committed` is not merely a policy flag — it is the only signal that
+   exists on that path.
 
 "Source docs say so" is not a finding; only observed behaviour is. If any row
 disagrees, stop and re-plan Task 7 before writing production code. Task 7's
@@ -1732,6 +1762,14 @@ and are dropped if it no longer matches.
 
 `provably_unsent` is `TrySendError::take_message().is_some()`. Idempotent methods
 are GET, HEAD, PUT, DELETE, OPTIONS, TRACE.
+
+**Check `SendRequest::is_closed()` before use.** Task 0 showed `take_message()`
+reports "hyper had not written it yet", not "the peer refused it". A request handed
+to a connection that has already received GOAWAY may get serialised before hyper
+processes it, and then comes back as `None` — a safely-retryable failure downgraded
+to `OUTCOME_UNKNOWN`. The pool must therefore skip senders whose `is_closed()` is
+true, and `may_retry` must treat `None` as an ordinary outcome rather than an
+anomaly.
 
 **A retry rebuilds the request; it never reuses the old one.** `hyper::Request` is
 consumed by `try_send_request`, and on the `take_message() == None` path it is not
