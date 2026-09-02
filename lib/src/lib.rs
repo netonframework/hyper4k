@@ -6,6 +6,7 @@
 //! 详细 ABI 契约见 `include/hyper4k.h`。
 
 pub mod abi;
+pub mod client;
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -720,16 +721,8 @@ mod tests {
     #[test]
     fn late_response_is_rejected_after_request_is_dropped() {
         // 连接断开后没有接收方：用非零但不存在的 responder 模拟。
-        let delivered = unsafe {
-            hyper4k_respond(
-                u64::MAX,
-                200,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                0,
-            )
-        };
+        let delivered =
+            unsafe { hyper4k_respond(u64::MAX, 200, std::ptr::null(), 0, std::ptr::null(), 0) };
 
         assert_eq!(delivered, 0);
     }
@@ -739,14 +732,7 @@ mod tests {
         let body = b"sync-body";
         let delivered = unsafe {
             IN_CALLBACK.set(true);
-            let r = hyper4k_respond(
-                42,
-                200,
-                std::ptr::null(),
-                0,
-                body.as_ptr(),
-                body.len(),
-            );
+            let r = hyper4k_respond(42, 200, std::ptr::null(), 0, body.as_ptr(), body.len());
             IN_CALLBACK.set(false);
             r
         };
@@ -797,10 +783,7 @@ mod tests {
 
         assert_eq!(hyper4k_response_finish(responder), HYPER4K_OK);
         // finish is idempotent: the second call is WRONG_STATE, not a double free.
-        assert_eq!(
-            hyper4k_response_finish(responder),
-            HYPER4K_ERR_WRONG_STATE
-        );
+        assert_eq!(hyper4k_response_finish(responder), HYPER4K_ERR_WRONG_STATE);
         // Writing after finish fails safely.
         assert_eq!(
             unsafe { hyper4k_response_write(responder, b"x".as_ptr(), 1) },
@@ -815,10 +798,7 @@ mod tests {
             unsafe { hyper4k_response_write(u64::MAX, b"x".as_ptr(), 1) },
             HYPER4K_ERR_WRONG_STATE
         );
-        assert_eq!(
-            hyper4k_response_finish(u64::MAX),
-            HYPER4K_ERR_WRONG_STATE
-        );
+        assert_eq!(hyper4k_response_finish(u64::MAX), HYPER4K_ERR_WRONG_STATE);
     }
 
     #[test]
@@ -864,9 +844,7 @@ mod tests {
         thread::spawn(move || {
             let headers = b"Content-Type: text/event-stream\nCache-Control: no-cache\n";
             assert_eq!(
-                unsafe {
-                    hyper4k_response_begin(responder, 200, headers.as_ptr(), headers.len())
-                },
+                unsafe { hyper4k_response_begin(responder, 200, headers.as_ptr(), headers.len()) },
                 HYPER4K_OK
             );
 
@@ -957,8 +935,9 @@ mod tests {
     fn accepts_http2_prior_knowledge_connections() {
         let port = free_port();
         let host = CString::new("127.0.0.1").expect("host");
-        let server =
-            unsafe { hyper4k_server_start(host.as_ptr(), port, test_handler, std::ptr::null_mut()) };
+        let server = unsafe {
+            hyper4k_server_start(host.as_ptr(), port, test_handler, std::ptr::null_mut())
+        };
         assert!(!server.is_null());
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -1071,7 +1050,12 @@ mod tests {
                     .and_then(|v| v.to_str().ok()),
                 Some("text/plain"),
             );
-            let body = response.into_body().collect().await.expect("body").to_bytes();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
             assert_eq!(&body[..], b"h2 body for /h2/single");
 
             // Two concurrent streams multiplexed on the same connection.
@@ -1094,8 +1078,18 @@ mod tests {
             let res_two = res_two.expect("stream two");
             assert_eq!(res_one.status(), 201);
             assert_eq!(res_two.status(), 201);
-            let body_one = res_one.into_body().collect().await.expect("body one").to_bytes();
-            let body_two = res_two.into_body().collect().await.expect("body two").to_bytes();
+            let body_one = res_one
+                .into_body()
+                .collect()
+                .await
+                .expect("body one")
+                .to_bytes();
+            let body_two = res_two
+                .into_body()
+                .collect()
+                .await
+                .expect("body two")
+                .to_bytes();
             assert_eq!(&body_one[..], b"h2 body for /h2/one");
             assert_eq!(&body_two[..], b"h2 body for /h2/two");
         });
