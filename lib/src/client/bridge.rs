@@ -208,6 +208,15 @@ struct Slot {
     done_ready: AtomicBool,
     /// True while this slot sits in the executor's ready queue.
     scheduled: AtomicBool,
+    /// True while a worker is inside `run_slice` for this slot.
+    ///
+    /// Without it two workers can run the same slot at once — one draining the
+    /// queue while the other, having found it empty, delivers `OnDone`. The
+    /// caller then sees an event after `OnDone`, which the spec forbids. It
+    /// showed up as a 1-in-14 flake, never when the test ran alone.
+    running: AtomicBool,
+    /// Set once `OnDone` has been delivered. Nothing may follow it.
+    finished_flag: AtomicBool,
     finished: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     counter: Arc<BridgeCounter>,
     executor: Arc<BridgeExecutor>,
@@ -274,6 +283,24 @@ impl Slot {
 
 impl Runnable for Slot {
     fn run_slice(&self, budget: usize) -> bool {
+        // One worker per slot. A loser bounces immediately; the owner re-queues
+        // if work remains, so nothing is lost.
+        if self.running.swap(true, Ordering::SeqCst) {
+            self.scheduled.store(false, Ordering::SeqCst);
+            return false;
+        }
+        let more = self.run_owned(budget);
+        self.running.store(false, Ordering::SeqCst);
+        if self.finished_flag.load(Ordering::SeqCst) {
+            return false; // OnDone was the last event, by contract
+        }
+        // Re-check: an event may have been queued while we held the slot.
+        more || !self.queue.lock().unwrap().is_empty()
+    }
+}
+
+impl Slot {
+    fn run_owned(&self, budget: usize) -> bool {
         self.scheduled.store(false, Ordering::SeqCst);
         if self.state.paused.load(Ordering::SeqCst) {
             return false;
@@ -333,6 +360,7 @@ impl Runnable for Slot {
                 self.deliver_done(&t);
                 // Only after OnDone has returned: the handle is dropped and
                 // free() may proceed.
+                self.finished_flag.store(true, Ordering::SeqCst);
                 if let Some(f) = self.finished.lock().unwrap().take() {
                     f();
                 }
@@ -488,6 +516,8 @@ pub(crate) fn spawn(
         terminal: StdMutex::new(None),
         done_ready: AtomicBool::new(false),
         scheduled: AtomicBool::new(false),
+        running: AtomicBool::new(false),
+        finished_flag: AtomicBool::new(false),
         finished: StdMutex::new(Some(Box::new(on_finished))),
         counter: counter.clone(),
         executor: executor.clone(),
@@ -544,5 +574,63 @@ mod counter_tests {
     fn wait_zero_returns_immediately_when_nothing_is_active() {
         let c = BridgeCounter::default();
         c.wait_zero();
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as AOrd};
+
+    /// Counts how many workers are inside `run_slice` at once.
+    struct Concurrent {
+        depth: AtomicU32,
+        max_depth: AtomicU32,
+        running: AtomicBool,
+        rounds: AtomicU32,
+    }
+
+    impl Runnable for Concurrent {
+        fn run_slice(&self, _budget: usize) -> bool {
+            // Mirrors Slot::run_slice's guard so the property can be tested
+            // without standing up a whole request.
+            if self.running.swap(true, AOrd::SeqCst) {
+                return false;
+            }
+            let d = self.depth.fetch_add(1, AOrd::SeqCst) + 1;
+            self.max_depth.fetch_max(d, AOrd::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            self.depth.fetch_sub(1, AOrd::SeqCst);
+            self.running.store(false, AOrd::SeqCst);
+            self.rounds.fetch_add(1, AOrd::SeqCst) < 200
+        }
+    }
+
+    #[test]
+    fn a_slot_never_runs_on_two_workers_at_once() {
+        // The 1-in-14 flake was exactly this: one worker draining the queue
+        // while another, finding it empty, delivered OnDone — so the caller saw
+        // an event after OnDone.
+        let ex = BridgeExecutor::new(8);
+        let slot = Arc::new(Concurrent {
+            depth: AtomicU32::new(0),
+            max_depth: AtomicU32::new(0),
+            running: AtomicBool::new(false),
+            rounds: AtomicU32::new(0),
+        });
+        // Queue the same slot from many threads, as a producer burst would.
+        for _ in 0..64 {
+            ex.schedule(slot.clone() as Arc<dyn Runnable>);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slot.rounds.load(AOrd::SeqCst) < 200 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        ex.shutdown();
+        assert_eq!(
+            slot.max_depth.load(AOrd::SeqCst),
+            1,
+            "a slot ran on more than one worker at once"
+        );
     }
 }
