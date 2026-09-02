@@ -4,6 +4,7 @@
 //! hyper or the crypto provider crosses the boundary.
 
 pub mod bridge;
+pub(crate) mod executor;
 pub mod handle;
 pub(crate) mod plaintext;
 pub(crate) mod pool;
