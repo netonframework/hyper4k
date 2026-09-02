@@ -3,6 +3,12 @@
 //! Kotlin sees only this module's exported functions. Nothing from rustls,
 //! hyper or the crypto provider crosses the boundary.
 
+pub(crate) mod plaintext;
+pub(crate) mod pool;
+
+#[cfg(test)]
+mod pool_tests;
+
 use crate::abi::*;
 use crate::Hyper4kSlice;
 use std::mem::{align_of, size_of};
