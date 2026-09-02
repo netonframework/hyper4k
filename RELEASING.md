@@ -1,15 +1,23 @@
 # Releasing
 
-All four targets are published from one macOS host. The Rust artifacts are static libraries
+All five targets are published from one macOS host. The Rust artifacts are static libraries
 (`.a` is a plain archive and never goes through the target linker), so cross-compilation needs
-only `rustup target add <triple>` — no Linux machine.
+no target linker and no Linux or Windows machine.
 
 ## Prerequisites
 
 ```
 rustup target add aarch64-apple-darwin x86_64-apple-darwin \
-                  aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+                  aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu \
+                  x86_64-pc-windows-gnu
+brew install mingw-w64   # only for the Windows target
 ```
+
+The Windows target uses the GNU ABI (`-gnu`, not `-msvc`) because that is what Kotlin/Native's
+mingwX64 links against. mingw-w64 is needed to compile the C sources in `aws-lc-sys`, the TLS
+backend; the build compiles them against Kotlin/Native's own msys2 sysroot headers so the
+compile-time and link-time libc agree. Building against Homebrew's newer headers instead yields
+`undefined symbol: nanosleep64` at link time.
 
 `~/.gradle/gradle.properties`:
 

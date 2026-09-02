@@ -1,3 +1,4 @@
+import org.gradle.api.tasks.PathSensitivity
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 
 plugins {
@@ -9,7 +10,7 @@ plugins {
 // com.netonstream 是本组织在 Maven Central 上已验证的 namespace。
 // hyper4k 是独立库（不是 neton-* 框架模块），所以不带 neton- 前缀，也走自己的版本线。
 group = "com.netonstream"
-version = "0.1.0"
+version = "0.1.1"
 
 repositories {
     mavenCentral()
@@ -21,7 +22,23 @@ val rustTriples = mapOf(
     "macosX64" to "x86_64-apple-darwin",
     "linuxX64" to "x86_64-unknown-linux-gnu",
     "linuxArm64" to "aarch64-unknown-linux-gnu",
+    // Kotlin/Native 的 mingwX64 用 GNU ABI，所以是 -gnu 而不是 -msvc。
+    // 交叉编译需要 mingw-w64（macOS: brew install mingw-w64），因为 TLS 后端
+    // aws-lc-rs 含 C 代码；Rust 侧本身不需要目标平台 linker（staticlib 是纯归档）。
+    "mingwX64" to "x86_64-pc-windows-gnu",
 )
+
+// Windows 交叉编译：C 代码必须用 K/N 链接时用的那套头文件来编译。
+// Homebrew 的 mingw-w64 14 把 nanosleep 拆成 nanosleep32/64 内联转发，而 K/N 自带的
+// msys2 sysroot 较老、只导出裸 nanosleep——用前者的头文件编译 aws-lc 的 C 代码，
+// 链接时就会出现 undefined symbol: nanosleep64。所以把编译器指向 K/N 的 sysroot 头文件。
+val konanMingwSysroot: File? by lazy {
+    val deps = File(System.getProperty("user.home"), ".konan/dependencies")
+    deps.listFiles()
+        ?.filter { it.isDirectory && it.name.startsWith("msys2-mingw-w64-x86_64") }
+        ?.map { File(it, "x86_64-w64-mingw32") }
+        ?.firstOrNull { File(it, "include/pthread_time.h").isFile }
+}
 
 // Rust crate 目录（Kotlin 项目根下的 lib/ 子目录）
 val crateDir = file("$projectDir/lib")
@@ -33,6 +50,7 @@ kotlin {
     macosX64()
     linuxX64()
     linuxArm64()
+    mingwX64()
 
     sourceSets {
         commonMain.dependencies {
@@ -57,6 +75,9 @@ kotlin {
 
         tasks.named(interop.interopProcessingTaskName).configure {
             dependsOn("cargoBuild${targetName.replaceFirstChar { it.uppercase() }}")
+            // libhyper4k.a 是通过 -libraryPath 传进去的，Gradle 看不见它。不声明成输入的话，
+            // cargo 重建了库、cinterop 仍然 UP-TO-DATE，klib 里会留着上一次的旧静态库。
+            inputs.file(File(libDir, "libhyper4k.a")).withPathSensitivity(PathSensitivity.NONE)
         }
 
         // 链接 hyper4k 需要的系统库（Rust std / tokio 依赖）
@@ -84,6 +105,16 @@ rustTriples.forEach { (ktTarget, triple) ->
         // 而 .so 要用目标平台的 linker——在 macOS 上 `cargo build` 会因为 ld 不认
         // --version-script 之类的 GNU 选项而失败，卡住的是我们根本不用的那个产物。
         commandLine("cargo", "rustc", "--release", "--target", triple, "--crate-type", "staticlib")
+
+        if (triple == "x86_64-pc-windows-gnu") {
+            // 需要 mingw-w64 交叉工具链（macOS: brew install mingw-w64）来编译 aws-lc 的 C 代码，
+            // 但头文件用 K/N 的 sysroot，保证编译期与链接期的 libc/pthread ABI 一致。
+            environment("CC_x86_64_pc_windows_gnu", "x86_64-w64-mingw32-gcc")
+            environment("AR_x86_64_pc_windows_gnu", "x86_64-w64-mingw32-ar")
+            konanMingwSysroot?.let {
+                environment("CFLAGS_x86_64_pc_windows_gnu", "-isystem ${File(it, "include").absolutePath}")
+            }
+        }
     }
 }
 
