@@ -3,8 +3,8 @@
 //! Kotlin sees only this module's exported functions. Nothing from rustls,
 //! hyper or the crypto provider crosses the boundary.
 
-pub(crate) mod bridge;
-pub(crate) mod handle;
+pub mod bridge;
+pub mod handle;
 pub(crate) mod plaintext;
 pub(crate) mod pool;
 pub(crate) mod retry;

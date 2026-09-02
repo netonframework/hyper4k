@@ -52,6 +52,11 @@ int32_t        hyper4k_response_finish(responder);
 默认并发是有界的：达到上限立即返回 503，单请求超过 deadline 返回 504。停止时先停止接收
 新任务、等待在途 handler 到达 grace deadline，再关闭 Tokio。不存在同步 handoff 开关。
 
+## 平台
+
+构建并测试四个 target：macosArm64、macosX64、linuxX64、linuxArm64。
+**不支持 Windows。** 一边声称支持一边不测试，比明确不支持更糟。
+
 ## 构建 Rust crate
 
 需要本机 Rust 工具链。在 `lib/` 目录下逐 target 产出 `libhyper4k.a`：
@@ -68,7 +73,6 @@ cargo build --release --target aarch64-apple-darwin     # macosArm64
 cargo build --release --target x86_64-apple-darwin      # macosX64
 cargo build --release --target x86_64-unknown-linux-gnu # linuxX64
 cargo build --release --target aarch64-unknown-linux-gnu# linuxArm64
-cargo build --release --target x86_64-pc-windows-gnu    # mingwX64
 ```
 
 跨平台交叉编译推荐 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)：
@@ -91,7 +95,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## 构建 Kotlin/Native 封装
 
-根目录的 `build.gradle.kts` 已配置：5 个 K/Native target、按 target 注入 `libhyper4k.a`
+根目录的 `build.gradle.kts` 已配置：4 个 K/Native target、按 target 注入 `libhyper4k.a`
 路径的 cinterop、各平台链接所需系统库，以及便捷的 `cargoBuild<Target>` 任务。
 
 本机 Kotlin/Native 验证：
@@ -146,5 +150,7 @@ Rust 底座收益最小——别用它来判断是否值得迁移。
 - [ ] Multipart upload support
 - [x] 流式 body / SSE relay（真 socket 分块测试把关，缓冲实现会让构建失败）
 - [x] HTTP/2 prior-knowledge（h2c）：真实 client handshake + 请求派发 + 同连接并发 stream
-- [ ] HTTP/2 over TLS（ALPN 协商，随 TLS 能力一并）
+- [x] Client TLS：HTTPS、SNI、证书校验、ALPN、连接池、带背压的流式、取消，
+      以及符合 RFC 9113 的安全重试
+- [ ] 服务端 TLS（仍由 nginx / Envoy / HAProxy 等入口终止）
 - [ ] 可选 `hyper4k-tower`：接入 Tower 生态（timeout / trace / load-shed）

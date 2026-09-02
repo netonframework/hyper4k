@@ -57,6 +57,12 @@ Concurrency is bounded by default: past the limit the server answers 503 immedia
 over its deadline gets 504. Shutdown stops accepting new work, waits for in-flight handlers up to the
 grace deadline, then shuts Tokio down. There is no synchronous-handoff switch.
 
+## Platforms
+
+Four targets are built and tested: macosArm64, macosX64, linuxX64, linuxArm64.
+**Windows is not supported.** Claiming a platform nobody builds or tests is worse
+than not claiming it.
+
 ## Building the Rust crate
 
 Needs a local Rust toolchain. Produce `libhyper4k.a` per target from `lib/`:
@@ -73,7 +79,6 @@ cargo build --release --target aarch64-apple-darwin      # macosArm64
 cargo build --release --target x86_64-apple-darwin       # macosX64
 cargo build --release --target x86_64-unknown-linux-gnu  # linuxX64
 cargo build --release --target aarch64-unknown-linux-gnu # linuxArm64
-cargo build --release --target x86_64-pc-windows-gnu     # mingwX64
 ```
 
 For cross-compiling, [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) is the easiest
@@ -97,7 +102,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Building the Kotlin/Native wrapper
 
-The root `build.gradle.kts` already covers it: five Kotlin/Native targets, per-target cinterop that
+The root `build.gradle.kts` already covers it: four Kotlin/Native targets, per-target cinterop that
 injects the matching `libhyper4k.a` path, the system libraries each platform needs to link, and
 convenience `cargoBuild<Target>` tasks.
 
@@ -157,5 +162,7 @@ gains the least — do not use that shape to decide whether a migration is worth
 - [ ] Multipart upload support
 - [x] Streaming body / SSE relay (guarded by a real-socket chunking test; a buffered implementation fails the build)
 - [x] HTTP/2 prior knowledge (h2c): real client handshake, request dispatch, concurrent streams on one connection
-- [ ] HTTP/2 over TLS (ALPN negotiation, together with TLS support)
+- [x] Client TLS: HTTPS, SNI, certificate validation, ALPN, connection pool,
+      streaming with backpressure, cancellation and RFC 9113-safe retry
+- [ ] Server-side TLS (still terminated upstream by nginx / Envoy / HAProxy)
 - [ ] Optional `hyper4k-tower`: Tower ecosystem integration (timeout / trace / load-shed)

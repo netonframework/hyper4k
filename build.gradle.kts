@@ -17,7 +17,6 @@ val rustTriples = mapOf(
     "macosX64" to "x86_64-apple-darwin",
     "linuxX64" to "x86_64-unknown-linux-gnu",
     "linuxArm64" to "aarch64-unknown-linux-gnu",
-    "mingwX64" to "x86_64-pc-windows-gnu",
 )
 
 // Rust crate 目录（Kotlin 项目根下的 lib/ 子目录）
@@ -30,7 +29,6 @@ kotlin {
     macosX64()
     linuxX64()
     linuxArm64()
-    mingwX64()
 
     sourceSets {
         commonMain.dependencies {

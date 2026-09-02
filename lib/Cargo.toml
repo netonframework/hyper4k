@@ -10,7 +10,9 @@ repository = "https://github.com/netonframework/hyper4k"
 name = "hyper4k"
 # staticlib -> 静态链进 Kotlin/Native 二进制（分发最干净）
 # cdylib    -> 本地开发 / JVM 侧也能用
-crate-type = ["staticlib", "cdylib"]
+# rlib is additive: it lets integration tests link the crate, and changes
+# nothing about the staticlib or cdylib outputs.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
