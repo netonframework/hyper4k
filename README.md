@@ -164,5 +164,8 @@ gains the least — do not use that shape to decide whether a migration is worth
 - [x] HTTP/2 prior knowledge (h2c): real client handshake, request dispatch, concurrent streams on one connection
 - [x] Client TLS: HTTPS, SNI, certificate validation, ALPN, connection pool,
       streaming with backpressure, cancellation and RFC 9113-safe retry
+- [x] Kotlin client (`hyper4k.Hyper4kClient`, 0.2.0): one `free`, callback bridging into a
+      per-request channel, PAUSE/resume backpressure, exactly-one `Done` on cancel
+- [x] HTTP proxy (ABI 4.1): absolute-form for `http://`, CONNECT tunnel for `https://`
 - [ ] Server-side TLS (still terminated upstream by nginx / Envoy / HAProxy)
 - [ ] Optional `hyper4k-tower`: Tower ecosystem integration (timeout / trace / load-shed)
