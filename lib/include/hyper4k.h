@@ -102,6 +102,7 @@ uint64_t    hyper4k_client_capabilities(void);
 #define HYPER4K_CLIENT_CAP_CUSTOM_CA (1ull << 3)
 #define HYPER4K_CLIENT_CAP_CANCEL    (1ull << 4)
 #define HYPER4K_CLIENT_CAP_STREAMING (1ull << 5)
+#define HYPER4K_CLIENT_CAP_PROXY     (1ull << 6)  /* ABI 4.1 */
 
 
 /* 借用的字节切片（ptr 可能为 NULL 当 len == 0） */
@@ -157,10 +158,24 @@ typedef struct {
     uint64_t       request_timeout_ms;    /* 0 disables; covers all retries    */
     uint64_t       read_idle_timeout_ms;  /* 0 disables; re-armed per chunk    */
     uint32_t       max_retries;           /* ADDITIONAL attempts; 0 = try once */
-    uint32_t       reserved;
+    uint32_t       max_inflight_requests; /* 0 = built-in default (1024)       */
+    uint64_t       max_buffered_bytes;    /* 0 = built-in default (64 MiB)     */
     const uint8_t *custom_ca_pem;         /* NULL = platform roots only        */
     size_t         custom_ca_pem_len;
+    /* ABI 4.1. NULL/0 = direct. "http://host[:port]": plaintext targets are
+       sent in absolute-form, TLS targets through a CONNECT tunnel. Credentials
+       and non-HTTP proxies are refused at hyper4k_client_new. */
+    const uint8_t *proxy_url;
+    size_t         proxy_url_len;
 } Hyper4kClientOptions;
+
+/* The Rust side is the source of truth for this layout. Before this assert the
+   header lacked two fields (max_inflight_requests, max_buffered_bytes): a C or
+   Kotlin caller then wrote custom_ca_pem eight bytes early, so the CA bundle
+   silently never applied while the client reported success. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(Hyper4kClientOptions) == 88, "Hyper4kClientOptions layout must match lib/src/client/mod.rs");
+#endif
 
 typedef struct {
     uint32_t             abi_version;

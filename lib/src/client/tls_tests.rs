@@ -89,7 +89,7 @@ impl TlsPeer {
 }
 
 /// TLS peer advertising exactly the given ALPN protocols.
-async fn spawn_tls_server(fx: TlsFixture, alpn: &[&str]) -> TlsPeer {
+pub(crate) async fn spawn_tls_server(fx: TlsFixture, alpn: &[&str]) -> TlsPeer {
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
     let certs: Vec<CertificateDer<'static>> =
@@ -300,6 +300,7 @@ fn a_malformed_ca_bundle_is_rejected_at_config_time() {
         replace_system_roots: true,
         require_h2: false,
         connect_timeout: Some(Duration::from_secs(1)),
+        proxy: None,
     };
     assert_eq!(build_tls_config(&opts).unwrap_err(), HYPER4K_ERR_TLS_CA);
 }

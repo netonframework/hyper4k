@@ -7,6 +7,7 @@ import hyper4k.cinterop.HYPER4K_CLIENT_CAP_CANCEL
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_CUSTOM_CA
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_HTTP1
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_HTTP2
+import hyper4k.cinterop.HYPER4K_CLIENT_CAP_PROXY
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_STREAMING
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_TLS
 import hyper4k.cinterop.HYPER4K_CLIENT_CA_REPLACE_SYSTEM
@@ -103,15 +104,20 @@ class Hyper4kClient(options: Hyper4kClientOptions = Hyper4kClientOptions()) {
             options.maxRetries?.let { opts.max_retries = it.toUInt() }
 
             val out = alloc<CPointerVar<cnames.structs.Hyper4kClient>>()
-            val pem = options.customCaPem
-            val status = if (pem != null && pem.isNotEmpty()) {
-                pem.usePinned { pinned ->
-                    opts.custom_ca_pem = pinned.addressOf(0).reinterpret()
-                    opts.custom_ca_pem_len = pem.size.convert()
-                    hyper4k_client_new(opts.ptr, out.ptr)
-                }
-            } else {
+            val pem = options.customCaPem ?: ByteArray(0)
+            val proxy = options.proxyUrl?.encodeToByteArray() ?: ByteArray(0)
+            // Both slices are borrowed only for the duration of the call.
+            val status = withPinned(listOf(pem, proxy)) { pins ->
+                opts.custom_ca_pem = pins[0].addressOfOrNull()
+                opts.custom_ca_pem_len = pem.size.convert()
+                opts.proxy_url = pins[1].addressOfOrNull()
+                opts.proxy_url_len = proxy.size.convert()
                 hyper4k_client_new(opts.ptr, out.ptr)
+            }
+            if (status == HYPER4K_STATUS_INVALID_ARG && options.proxyUrl != null) {
+                throw IllegalArgumentException(
+                    "hyper4k rejected proxyUrl '${options.proxyUrl}': only http://host[:port] without credentials is supported",
+                )
             }
             checkStatus(status, "client_new")
             out.value ?: error("hyper4k_client_new returned OK without a client")
@@ -222,6 +228,7 @@ class Hyper4kClient(options: Hyper4kClientOptions = Hyper4kClientOptions()) {
                 customCa = bits and HYPER4K_CLIENT_CAP_CUSTOM_CA != 0uL,
                 cancel = bits and HYPER4K_CLIENT_CAP_CANCEL != 0uL,
                 streaming = bits and HYPER4K_CLIENT_CAP_STREAMING != 0uL,
+                proxy = bits and HYPER4K_CLIENT_CAP_PROXY != 0uL,
             )
         }
 
@@ -252,6 +259,12 @@ class Hyper4kClientOptions(
     /** PEM bundle appended to (or, with [replaceSystemCa], replacing) the platform roots. */
     val customCaPem: ByteArray? = null,
     val replaceSystemCa: Boolean = false,
+    /**
+     * Forward HTTP proxy, `http://host[:port]` (ABI 4.1). Plaintext targets are
+     * sent through it in absolute-form, TLS targets through a CONNECT tunnel.
+     * Credentials and non-HTTP proxies are refused at construction.
+     */
+    val proxyUrl: String? = null,
 )
 
 class Hyper4kClientRequest(
@@ -270,6 +283,7 @@ data class Hyper4kClientCapabilities(
     val customCa: Boolean,
     val cancel: Boolean,
     val streaming: Boolean,
+    val proxy: Boolean,
 )
 
 /** One event of a response, in the order the ABI promises: Headers, Chunk*, Done. */

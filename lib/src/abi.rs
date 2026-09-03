@@ -112,7 +112,7 @@ pub struct Hyper4kError {
 // ---------------------------------------------------------------------------
 
 /// `(major << 16) | minor`. A major change means incompatible.
-const ABI_VERSION: u32 = 4 << 16; // major 4, minor 0
+const ABI_VERSION: u32 = (4 << 16) | 1; // major 4, minor 1: proxy_url in options
 
 const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
@@ -143,6 +143,8 @@ pub const HYPER4K_CLIENT_CAP_TLS: u64 = 1 << 2;
 pub const HYPER4K_CLIENT_CAP_CUSTOM_CA: u64 = 1 << 3;
 pub const HYPER4K_CLIENT_CAP_CANCEL: u64 = 1 << 4;
 pub const HYPER4K_CLIENT_CAP_STREAMING: u64 = 1 << 5;
+/// ABI 4.1: forward HTTP proxy (absolute-form for http, CONNECT for https).
+pub const HYPER4K_CLIENT_CAP_PROXY: u64 = 1 << 6;
 // No h2c bit: v4 ships no cleartext HTTP/2 client.
 
 /// Client capabilities.
@@ -158,6 +160,7 @@ pub extern "C" fn hyper4k_client_capabilities() -> u64 {
         | HYPER4K_CLIENT_CAP_CUSTOM_CA
         | HYPER4K_CLIENT_CAP_CANCEL
         | HYPER4K_CLIENT_CAP_STREAMING
+        | HYPER4K_CLIENT_CAP_PROXY
 }
 
 #[cfg(test)]
@@ -165,10 +168,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_four_zero() {
+    fn abi_version_is_four_one() {
         // Spelled out rather than reusing ABI_VERSION: this pins the value a
         // Kotlin or C consumer will hold, not our own expression for it.
-        assert_eq!(hyper4k_abi_version(), 0x0004_0000);
+        assert_eq!(hyper4k_abi_version(), 0x0004_0001);
     }
 
     #[test]

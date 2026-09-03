@@ -13,7 +13,6 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 /// Per-stream flow-control window.
@@ -34,6 +33,8 @@ pub(crate) struct TlsOptions {
     pub custom_ca_pem: Option<Vec<u8>>,
     pub replace_system_roots: bool,
     pub require_h2: bool,
+    /// ABI 4.1: CONNECT through this proxy before the handshake.
+    pub proxy: Option<super::proxy::ProxyTarget>,
     pub connect_timeout: Option<Duration>,
 }
 
@@ -153,6 +154,7 @@ pub(crate) struct TlsClientConnector {
     config: Arc<ClientConfig>,
     require_h2: bool,
     connect_timeout: Option<Duration>,
+    proxy: Option<super::proxy::ProxyTarget>,
 }
 
 impl TlsClientConnector {
@@ -161,6 +163,7 @@ impl TlsClientConnector {
             config: Arc::new(build_tls_config(opts)?),
             require_h2: opts.require_h2,
             connect_timeout: opts.connect_timeout,
+            proxy: opts.proxy.clone(),
         })
     }
 }
@@ -172,20 +175,18 @@ impl Connector for TlsClientConnector {
         let config = self.config.clone();
         let require_h2 = self.require_h2;
         let timeout = self.connect_timeout;
+        let proxy = self.proxy.clone();
+        let port = key.port;
 
         Box::pin(async move {
             let Ok(server_name) = ServerName::try_from(host.clone()) else {
                 return Err(HYPER4K_ERR_TLS_HOSTNAME);
             };
-            let tcp = {
-                let fut = TcpStream::connect(&addr);
-                match timeout {
-                    Some(d) => tokio::time::timeout(d, fut)
-                        .await
-                        .map_err(|_| HYPER4K_ERR_TIMEOUT)?
-                        .map_err(|_| HYPER4K_ERR_CONNECT)?,
-                    None => fut.await.map_err(|_| HYPER4K_ERR_CONNECT)?,
-                }
+            // Through a proxy the TCP stream is a CONNECT tunnel; everything
+            // from here on (validation, ALPN, h2 windows) is unchanged.
+            let tcp = match &proxy {
+                Some(p) => super::proxy::tunnel(p, &host, port, timeout).await?,
+                None => super::proxy::dial(&addr, timeout).await?,
             };
 
             let tls = TlsConnector::from(config)

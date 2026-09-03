@@ -6,6 +6,7 @@ import kotlinx.cinterop.ExperimentalForeignApi
 import hyper4k.cinterop.HYPER4K_CHUNK_PAUSE
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_HTTP2
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_STREAMING
+import hyper4k.cinterop.HYPER4K_CLIENT_CAP_PROXY
 import hyper4k.cinterop.HYPER4K_CLIENT_CAP_TLS
 import hyper4k.cinterop.HYPER4K_ERR_OUTCOME_UNKNOWN
 import hyper4k.cinterop.HYPER4K_HEADERS_CANCEL
@@ -39,8 +40,8 @@ class AbiWidthTest {
     }
 
     @Test
-    fun abiVersionIsFourZero() {
-        assertEquals((4 shl 16) or 0, hyper4k_abi_version().toInt())
+    fun abiVersionIsFourOne() {
+        assertEquals((4 shl 16) or 1, hyper4k_abi_version().toInt())
     }
 
     @Test
@@ -50,5 +51,6 @@ class AbiWidthTest {
         assertEquals(HYPER4K_CLIENT_CAP_TLS, caps and HYPER4K_CLIENT_CAP_TLS)
         assertEquals(HYPER4K_CLIENT_CAP_HTTP2, caps and HYPER4K_CLIENT_CAP_HTTP2)
         assertEquals(HYPER4K_CLIENT_CAP_STREAMING, caps and HYPER4K_CLIENT_CAP_STREAMING)
+        assertEquals(HYPER4K_CLIENT_CAP_PROXY, caps and HYPER4K_CLIENT_CAP_PROXY)
     }
 }

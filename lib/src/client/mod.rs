@@ -8,6 +8,7 @@ pub(crate) mod executor;
 pub mod handle;
 pub(crate) mod plaintext;
 pub(crate) mod pool;
+pub(crate) mod proxy;
 pub(crate) mod retry;
 pub(crate) mod tls;
 
@@ -17,6 +18,8 @@ mod backpressure_tests;
 pub(crate) mod handle_tests;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(test)]
+mod proxy_tests;
 #[cfg(test)]
 mod retry_tests;
 #[cfg(test)]
@@ -74,6 +77,11 @@ pub struct Hyper4kClientOptions {
     /// NULL uses the platform roots only.
     pub custom_ca_pem: *const u8,
     pub custom_ca_pem_len: usize,
+    /// ABI 4.1. NULL/0 means direct connections. Otherwise `http://host[:port]`:
+    /// plaintext targets go through it in absolute-form, TLS targets through a
+    /// CONNECT tunnel. Credentials and non-HTTP proxies are refused.
+    pub proxy_url: *const u8,
+    pub proxy_url_len: usize,
 }
 
 #[repr(C)]
@@ -148,6 +156,8 @@ pub unsafe extern "C" fn hyper4k_client_options_init(
         max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
         custom_ca_pem: std::ptr::null(),
         custom_ca_pem_len: 0,
+        proxy_url: std::ptr::null(),
+        proxy_url_len: 0,
     };
     init_prefix(opts, struct_size, OPTIONS_MIN_SIZE, defaults)
 }

@@ -163,8 +163,15 @@ class Hyper4kClientTest {
     }
 
     @Test
+    fun anUnusableProxyUrlIsRefusedAtConstruction() {
+        assertFailsWith<IllegalArgumentException> {
+            Hyper4kClient(Hyper4kClientOptions(proxyUrl = "socks5://proxy:1080"))
+        }
+    }
+
+    @Test
     fun engineReportsItsCapabilities() {
         val caps = Hyper4kClient.engineCapabilities()
-        assertTrue(caps.http1 && caps.http2 && caps.tls && caps.cancel && caps.streaming, caps.toString())
+        assertTrue(caps.http1 && caps.http2 && caps.tls && caps.cancel && caps.streaming && caps.proxy, caps.toString())
     }
 }

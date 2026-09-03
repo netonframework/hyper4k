@@ -40,6 +40,9 @@ pub struct Hyper4kClient {
     max_retries: u32,
     request_timeout: Option<Duration>,
     read_idle_timeout: Option<Duration>,
+    /// Set when the client was built with a proxy: plaintext requests must then
+    /// keep absolute-form targets (that is how a proxy learns the origin).
+    via_proxy: bool,
 }
 
 /// Client-wide ceilings.
@@ -122,6 +125,8 @@ pub(crate) struct RequestTemplate {
     pub headers: Vec<(Bytes, Bytes)>,
     pub body: Bytes,
     pub authority: String,
+    /// Keep the full URL on the wire (request goes to a proxy).
+    pub absolute_form: bool,
 }
 
 impl RequestTemplate {
@@ -231,11 +236,27 @@ pub unsafe extern "C" fn hyper4k_client_new(
     } else {
         Some(std::slice::from_raw_parts(o.custom_ca_pem, o.custom_ca_pem_len).to_vec())
     };
+    // A proxy that cannot be honoured is refused here, not on the first
+    // request: a client that silently connects directly when it was told to
+    // use a proxy is leaking traffic, not degrading gracefully.
+    let proxy = if o.proxy_url.is_null() || o.proxy_url_len == 0 {
+        None
+    } else {
+        let raw = std::slice::from_raw_parts(o.proxy_url, o.proxy_url_len);
+        let Ok(text) = std::str::from_utf8(raw) else {
+            return HYPER4K_STATUS_INVALID_ARG;
+        };
+        match super::proxy::ProxyTarget::parse(text) {
+            Some(p) => Some(p),
+            None => return HYPER4K_STATUS_INVALID_ARG,
+        }
+    };
     let tls_opts = super::tls::TlsOptions {
         custom_ca_pem: custom_ca,
         replace_system_roots: o.flags & HYPER4K_CLIENT_CA_REPLACE_SYSTEM != 0,
         require_h2: o.flags & HYPER4K_CLIENT_HTTP2_REQUIRED != 0,
         connect_timeout,
+        proxy: proxy.clone(),
     };
     // Built eagerly: a bad CA bundle should fail at construction, not on the
     // first request where it looks like a network problem.
@@ -250,7 +271,10 @@ pub unsafe extern "C" fn hyper4k_client_new(
 
     let client = Hyper4kClient {
         runtime: Some(runtime),
-        pool: Arc::new(Pool::new(Arc::new(PlaintextConnector { connect_timeout }))),
+        pool: Arc::new(Pool::new(Arc::new(PlaintextConnector {
+            connect_timeout,
+            proxy: proxy.clone(),
+        }))),
         tls_pool,
         requests: Arc::new(DashMap::new()),
         next_id: AtomicU64::new(1),
@@ -266,6 +290,7 @@ pub unsafe extern "C" fn hyper4k_client_new(
         ),
         limits: Arc::new(Limits::new(o.max_inflight_requests, o.max_buffered_bytes)),
         max_retries: o.max_retries,
+        via_proxy: proxy.is_some(),
         request_timeout: (o.request_timeout_ms != 0)
             .then(|| Duration::from_millis(o.request_timeout_ms)),
         read_idle_timeout: (o.read_idle_timeout_ms != 0)
@@ -456,6 +481,9 @@ pub unsafe extern "C" fn hyper4k_client_send(
         headers,
         body,
         authority: format!("{host}:{port}"),
+        // Only plaintext needs absolute-form: a TLS target is reached through a
+        // CONNECT tunnel, and inside the tunnel the origin sees a direct request.
+        absolute_form: c.via_proxy && scheme == "http",
     };
     if !template.validate() {
         return HYPER4K_STATUS_INVALID_ARG;
@@ -722,7 +750,10 @@ async fn attempt_loop(
             // you, and skipping it here was invisible against hyper's own server,
             // which accepts either. HTTP/2 keeps the full URI: the :scheme and
             // :authority pseudo-headers are derived from it.
-            Sender::H1(s) => s.try_send_request(to_origin_form(req)).await,
+            Sender::H1(s) => {
+                let req = if template.absolute_form { req } else { to_origin_form(req) };
+                s.try_send_request(req).await
+            }
             Sender::H2(s) => s.try_send_request(req).await,
         };
 

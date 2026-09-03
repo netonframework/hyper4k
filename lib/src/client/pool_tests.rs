@@ -91,9 +91,7 @@ async fn spawn_h2_server() -> Peer {
 // --- connectors ------------------------------------------------------------
 
 fn plaintext() -> Arc<dyn Connector> {
-    Arc::new(PlaintextConnector {
-        connect_timeout: Some(Duration::from_secs(5)),
-    })
+    Arc::new(PlaintextConnector { connect_timeout: Some(Duration::from_secs(5)), proxy: None })
 }
 
 /// Test-only connector that speaks HTTP/2 over cleartext.
