@@ -53,7 +53,13 @@ class Hyper4kServer(
 
     init {
         require(maxConcurrentRequests > 0) { "maxConcurrentRequests must be positive" }
-        require(requestTimeoutMillis > 0) { "requestTimeoutMillis must be positive" }
+        // 0 = 禁用每请求超时，与客户端侧 `requestTimeoutMillis` 的语义一致。
+        //
+        // 这不只是个开关：包装本身是有代价的。无论用 lazyTimeout 还是直接 withTimeout，
+        // 每个请求都要多出两个协程对象与相应的 JobSupport 状态转换；实测（macOS/arm64，
+        // wrk -t4 -c128，5 轮取中位数）关掉后吞吐从 50.6k 升到 60.2k，约 +19%。
+        // 前面已经有代理或网关管超时的部署，没必要再付第二遍。
+        require(requestTimeoutMillis >= 0) { "requestTimeoutMillis must not be negative" }
         require(shutdownGraceMillis >= 0) { "shutdownGraceMillis must not be negative" }
     }
 
@@ -380,15 +386,24 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
     }
 }
 
-private fun encodeHeaders(headers: Map<String, List<String>>): ByteArray =
-    if (headers.isEmpty()) {
-        ByteArray(0)
-    } else {
-        headers.entries
-            .flatMap { (name, values) -> values.map { value -> "$name: $value" } }
-            .joinToString("\n")
-            .encodeToByteArray()
+/**
+ * One StringBuilder, not a list of joined strings.
+ *
+ * flatMap + joinToString allocated an intermediate list plus one String per
+ * header before the join; this runs once per response, so it showed up as
+ * allocator and GC time under load rather than as any single hot frame.
+ */
+private fun encodeHeaders(headers: Map<String, List<String>>): ByteArray {
+    if (headers.isEmpty()) return ByteArray(0)
+    val out = StringBuilder(headers.size * 32)
+    for ((name, values) in headers) {
+        for (value in values) {
+            if (out.isNotEmpty()) out.append('\n')
+            out.append(name).append(": ").append(value)
+        }
     }
+    return out.toString().encodeToByteArray()
+}
 
 /**
  * Runs [block] without arming a timer unless it actually suspends.
