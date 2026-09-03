@@ -88,7 +88,7 @@ typedef struct { const uint8_t *ptr; size_t len; } Hyper4kSlice;
 typedef struct { Hyper4kSlice name; Hyper4kSlice value; } Hyper4kHeader;
 
 /* ABI 版本：(major << 16) | minor。major 变化即不兼容。 */
-#define HYPER4K_ABI_VERSION  ((4u << 16) | 0u)
+#define HYPER4K_ABI_VERSION  ((4u << 16) | 1u)
 ```
 
 **同步返回码统一为 `Hyper4kStatus`，数值冻结**。`new` / `send` / `cancel` /
@@ -139,6 +139,7 @@ typedef int32_t Hyper4kStatus;
 #define HYPER4K_CLIENT_CAP_CUSTOM_CA     (1ull << 3)
 #define HYPER4K_CLIENT_CAP_CANCEL        (1ull << 4)
 #define HYPER4K_CLIENT_CAP_STREAMING     (1ull << 5)  /* 响应体分块 + 背压 */
+#define HYPER4K_CLIENT_CAP_PROXY         (1ull << 6)  /* ABI 4.1，见 §2.2.1 */
 /* v4 不提供 h2c prior knowledge（明文 HTTP/2），故无对应位。 */
 
 /* client flags */
@@ -161,8 +162,13 @@ typedef struct {
     uint64_t       read_idle_timeout_ms;     /* 0 = 不限块间空闲 */
     uint32_t       max_retries;              /* 额外重试次数，0 = 不重试 */
     uint32_t       _reserved;
+    uint32_t       max_inflight_requests;    /* 0 = 内置默认 1024 */
+    uint64_t       max_buffered_bytes;       /* 0 = 内置默认 64 MiB */
     const uint8_t *custom_ca_pem;            /* NULL = 只用系统根证书 */
     size_t         custom_ca_pem_len;
+    /* ABI 4.1 */
+    const uint8_t *proxy_url;                /* NULL = 直连；"http://host[:port]" */
+    size_t         proxy_url_len;
 } Hyper4kClientOptions;
 
 /* 填入本版本默认值（含 max_retries = 2）。
@@ -189,6 +195,26 @@ Hyper4kStatus hyper4k_client_options_init(Hyper4kClientOptions *opts,
 
 `hyper4k_client_new()` 在调用内复制 options 指向的全部数据，返回后调用方缓冲即可
 释放。
+
+**头文件布局曾与 Rust 不一致（已修，附 `_Static_assert(sizeof == 88)`）**：头文件
+一度缺少 `max_inflight_requests` / `max_buffered_bytes` 两个字段，C / Kotlin 调用方
+写入的 `custom_ca_pem` 因此提前了 8 字节，落到 Rust 的 `max_buffered_bytes` 上——
+自定义 CA 静默失效而 `hyper4k_client_new` 返回 OK。Rust 结构体是布局的唯一真源。
+
+### 2.2.1 代理（ABI 4.1）
+
+`proxy_url` 只接受 `http://host[:port]`：不带凭据、不带路径、不支持 https/socks
+代理——任一违反在 `hyper4k_client_new` 直接 `INVALID_ARG`，而不是静默直连
+（被告知走代理却直连，是泄漏流量而不是降级）。
+
+| 目标 | 行为 |
+|---|---|
+| `http://` | 连到代理，请求行使用 **absolute-form**（`GET http://host/path`） |
+| `https://` | 连到代理，`CONNECT host:port`，2xx 后在隧道上做正常 TLS 握手（证书校验、ALPN、h2 窗口全部不变） |
+
+错误：代理连不上 → `CONNECT`；CONNECT 被拒（非 2xx）或响应不是 HTTP → `PROTOCOL`；
+`connect_timeout_ms` 覆盖「连代理 + CONNECT 往返」整个阶段。能力位
+`HYPER4K_CLIENT_CAP_PROXY (1<<6)`；`hyper4k_abi_version()` 变为 `(4<<16)|1`。
 
 ### 2.3 生命周期与线程模型
 
