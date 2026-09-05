@@ -30,6 +30,8 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 
 /**
@@ -135,6 +137,9 @@ internal class AsyncRequestDispatcher(
     private val accepting = AtomicBoolean(true)
     private val activeRequests = AtomicInt(0)
     private val slots = Semaphore(maxConcurrentRequests)
+
+    /** Responses the engine refused to take. Any value above zero is a bug. */
+    val droppedResponses = AtomicLong(0)
     private val rootJob = SupervisorJob()
     private val scope = CoroutineScope(rootJob + Dispatchers.Default)
 
@@ -242,11 +247,20 @@ internal class AsyncRequestDispatcher(
         }
     }
 
+    /**
+     * A false return means the engine did not take the response: the request is
+     * now waiting for something that will never arrive, and the client will sit
+     * there until it gives up and reconnects.
+     *
+     * Counted rather than thrown — this runs on the callback boundary, where an
+     * exception must not cross — so a lost response shows up as a number instead
+     * of as unexplained tail latency. [droppedResponses] is the signal to watch.
+     */
     private fun completeSafely(responder: ULong, response: Hyper4kResponse) {
         try {
-            complete(responder, response)
+            if (!complete(responder, response)) droppedResponses.incrementAndFetch()
         } catch (_: Throwable) {
-            // Exceptions must never cross the Kotlin/C/Rust callback boundary.
+            droppedResponses.incrementAndFetch()
         }
     }
 

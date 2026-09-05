@@ -176,7 +176,17 @@ static ACTIVE_STREAMS: OnceLock<DashMap<u64, mpsc::Sender<Bytes>>> = OnceLock::n
 // ABI v2 同步快路径：回调在 Tokio worker 线程上执行，若 handler 在回调内同步完成，
 // hyper4k_respond 直接把响应写入线程本地槽，省掉 DashMap 注册 + oneshot 交接。
 thread_local! {
-    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+    /// The responder this thread is currently inside the Kotlin callback for,
+    /// or 0 when it is not in one.
+    ///
+    /// It carries the id rather than a bare flag because the fast path below is
+    /// only safe for *this* request. A bare flag let any delivery that happened
+    /// to run on this thread during the callback take the slot: a coroutine
+    /// resuming here for some other request would either lose its response (slot
+    /// already taken, and the caller discards the failure) or have it collected
+    /// as the answer to the request being handled. Both are invisible from the
+    /// outside until the client gives up and reconnects.
+    static IN_CALLBACK: Cell<u64> = const { Cell::new(0) };
     static SYNC_RESPONSE: std::cell::RefCell<Option<Delivery>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -306,7 +316,7 @@ async fn handle(
 
     // 这些局部变量（method/path/query/header_buf/body）在 await 期间保持存活，
     // 因此借用给 Kotlin 的切片在 hyper4k_respond 被调用前始终有效。
-    IN_CALLBACK.set(true);
+    IN_CALLBACK.set(responder);
     {
         let creq = Hyper4kRequest {
             method: Hyper4kSlice::borrow(method.as_bytes()),
@@ -321,7 +331,7 @@ async fn handle(
         // 响应落入线程本地槽；异步路径照旧走 responder 通道。
         (ctx.cb)(ctx.user_data, &creq as *const Hyper4kRequest);
     }
-    IN_CALLBACK.set(false);
+    IN_CALLBACK.set(0);
 
     let delivery = match take_sync_response() {
         // Sync path: the _pending guard clears the registry when handle returns.
@@ -458,10 +468,24 @@ pub unsafe extern "C" fn hyper4k_respond(
 }
 
 fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
-    if IN_CALLBACK.get() {
-        // 同步快路径：响应直接交给 handle()，跳过通道唤醒。
-        return i32::from(set_sync_response(delivery));
+    // 同步快路径：响应直接交给 handle()，跳过通道唤醒。只对本线程当前正在回调的
+    // 那个请求生效——别的请求即使恰好在这条线程上完成，也必须走通道。
+    if IN_CALLBACK.get() == responder {
+        if set_sync_response(delivery) {
+            return 1;
+        }
+        // 槽位被占本不该发生（一个线程同时只在一个回调里）。真发生了也不能丢响应：
+        // 落回通道，handle() 取不到槽时会 await 它。
+        return deliver_through_channel(responder, Delivery::Buffered(ResponseData {
+            status: 500,
+            headers: Vec::new(),
+            body: b"hyper4k: sync response slot busy".to_vec(),
+        }));
     }
+    deliver_through_channel(responder, delivery)
+}
+
+fn deliver_through_channel(responder: u64, delivery: Delivery) -> i32 {
     let sender = pending_responses().remove(&responder);
     i32::from(
         sender
@@ -731,9 +755,9 @@ mod tests {
     fn sync_respond_inside_callback_is_captured_by_slot() {
         let body = b"sync-body";
         let delivered = unsafe {
-            IN_CALLBACK.set(true);
+            IN_CALLBACK.set(42);
             let r = hyper4k_respond(42, 200, std::ptr::null(), 0, body.as_ptr(), body.len());
-            IN_CALLBACK.set(false);
+            IN_CALLBACK.set(0);
             r
         };
         assert_eq!(delivered, 1);
@@ -744,13 +768,45 @@ mod tests {
 
         // 槽位已清空后，同线程再次同步响应仍能落入。
         let delivered2 = unsafe {
-            IN_CALLBACK.set(true);
+            IN_CALLBACK.set(7);
             let r = hyper4k_respond(7, 201, std::ptr::null(), 0, b"x".as_ptr(), 1);
-            IN_CALLBACK.set(false);
+            IN_CALLBACK.set(0);
             r
         };
         assert_eq!(delivered2, 1);
         assert_eq!(buffered(take_sync_response().unwrap()).status, 201);
+    }
+
+    /// A delivery for some *other* request must not touch this thread's slot.
+    ///
+    /// This is the case the flag-only version got wrong. A coroutine resuming on
+    /// a thread that happens to be inside another request's callback used to park
+    /// its response in that thread's slot: `handle()` then collected it as the
+    /// answer to the request it was serving, and the request it actually belonged
+    /// to waited on a channel nobody would ever send to.
+    #[test]
+    fn a_delivery_for_another_responder_does_not_take_the_slot() {
+        let (other, mut other_rx, _registration) = register_response();
+
+        let delivered = unsafe {
+            // This thread is serving responder 99; the delivery below is not for it.
+            IN_CALLBACK.set(99);
+            let r = hyper4k_respond(other, 200, std::ptr::null(), 0, b"mine".as_ptr(), 4);
+            IN_CALLBACK.set(0);
+            r
+        };
+        assert_eq!(delivered, 1, "the other request must still be answered");
+
+        // Nothing was parked here, so responder 99 would correctly fall through
+        // to its own channel rather than stealing this response.
+        assert!(
+            take_sync_response().is_none(),
+            "a foreign delivery must not occupy the slot"
+        );
+
+        // And it reached the request it belongs to, intact.
+        let data = buffered(other_rx.try_recv().expect("the owner receives it"));
+        assert_eq!(data.body, b"mine");
     }
 
     // -----------------------------------------------------------------------
