@@ -26,8 +26,13 @@ class Hyper4kRequest(
     /** 原始头块文本（从字节惰性解码）。 */
     val rawHeaders: String by lazy(LazyThreadSafetyMode.NONE) { rawHeaderBytes.decodeToString() }
 
+    private var headersOrNull: Map<String, List<String>>? = null
+
     /** 解析后的请求头（大小写按原样保留；查找见 [header]）。 */
-    val headers: Map<String, List<String>> by lazy(LazyThreadSafetyMode.NONE) {
+    val headers: Map<String, List<String>>
+        get() = headersOrNull ?: parseHeaders().also { headersOrNull = it }
+
+    private fun parseHeaders(): Map<String, List<String>> = run {
         if (rawHeaderBytes.isEmpty()) emptyMap() else buildMap<String, MutableList<String>> {
             // 直接从字节解码，避免先造 String 再 split 的二次分配。
             for (line in rawHeaderBytes.decodeToString().split('\n')) {
@@ -41,9 +46,65 @@ class Hyper4kRequest(
         }.mapValues { it.value.toList() }
     }
 
-    /** 大小写不敏感取头。 */
-    fun header(name: String): String? =
-        headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
+    /**
+     * 大小写不敏感取头，不解析整块。
+     *
+     * 走 [headers] 会为一次查找建出整张 map：一个 HashMap，外加每个头两个 String
+     * 和一个 List。分发链在入口就要读一个 `X-Request-Id`，于是每个请求都付了这笔
+     * 钱，而绝大多数请求根本不看其余的头。这里直接在原始字节上扫。
+     */
+    fun header(name: String): String? {
+        headersOrNull?.let { parsed ->
+            return parsed.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
+        }
+        val target = name.encodeToByteArray()
+        val raw = rawHeaderBytes
+        var lineStart = 0
+        while (lineStart < raw.size) {
+            var lineEnd = lineStart
+            while (lineEnd < raw.size && raw[lineEnd] != NEWLINE) lineEnd++
+            val colon = indexOfColon(raw, lineStart, lineEnd)
+            if (colon > lineStart && matchesIgnoreCase(raw, lineStart, colon, target)) {
+                var vs = colon + 1
+                while (vs < lineEnd && (raw[vs] == SPACE || raw[vs] == TAB)) vs++
+                var ve = lineEnd
+                while (ve > vs && (raw[ve - 1] == SPACE || raw[ve - 1] == TAB || raw[ve - 1] == CR)) ve--
+                return raw.decodeToString(vs, ve)
+            }
+            lineStart = lineEnd + 1
+        }
+        return null
+    }
+
+    private companion object {
+        const val NEWLINE: Byte = 0x0A
+        const val CR: Byte = 0x0D
+        const val COLON: Byte = 0x3A
+        const val SPACE: Byte = 0x20
+        const val TAB: Byte = 0x09
+
+        fun indexOfColon(raw: ByteArray, from: Int, to: Int): Int {
+            var i = from
+            while (i < to) { if (raw[i] == COLON) return i; i++ }
+            return -1
+        }
+
+        /** ASCII 大小写不敏感比较；头名按 RFC 只能是 ASCII。 */
+        fun matchesIgnoreCase(raw: ByteArray, from: Int, to: Int, target: ByteArray): Boolean {
+            if (to - from != target.size) return false
+            var i = 0
+            while (i < target.size) {
+                val a = lower(raw[from + i])
+                val b = lower(target[i])
+                if (a != b) return false
+                i++
+            }
+            return true
+        }
+
+        fun lower(b: Byte): Byte =
+            if (b >= 'A'.code.toByte() && b <= 'Z'.code.toByte()) (b + 32).toByte() else b
+    }
 }
 
 /**
