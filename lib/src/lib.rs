@@ -395,31 +395,182 @@ pub unsafe extern "C" fn hyper4k_server_start(
         cb: on_request,
         user_data,
     });
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    runtime.spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                accept = listener.accept() => {
-                    let (stream, _peer) = match accept {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let io = TokioIo::new(stream);
-                    let ctx = ctx.clone();
-                    tokio::spawn(async move {
-                        let service = service_fn(move |req| handle(req, ctx.clone()));
-                        // auto::Builder sniffs the connection preface, so a single
-                        // port serves h1 and h2c. No ALPN: TLS terminates upstream.
-                        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                            .serve_connection(io, service)
-                            .await;
-                    });
-                }
+    runtime.spawn(serve_plaintext(listener, ctx, shutdown_rx));
+
+    Box::into_raw(Box::new(Hyper4kServer {
+        _runtime: runtime,
+        shutdown_tx: Some(shutdown_tx),
+    }))
+}
+
+/// Serves a plaintext listener until `shutdown` fires.
+///
+/// `auto::Builder` sniffs the connection preface, so one port answers both
+/// HTTP/1.1 and h2c.
+async fn serve_plaintext(
+    listener: TcpListener,
+    ctx: Arc<CallbackCtx>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accept = listener.accept() => {
+                let (stream, _peer) = match accept {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| handle(req, ctx.clone()));
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
             }
         }
+    }
+}
+
+/// Serves a TLS listener until `shutdown` fires.
+///
+/// The handshake runs on the connection's own task rather than in the accept
+/// loop: a slow or hostile peer that never finishes one would otherwise stall
+/// every connection queued behind it.
+async fn serve_tls(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    ctx: Arc<CallbackCtx>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accept = listener.accept() => {
+                let (stream, _peer) = match accept {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let ctx = ctx.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(t) => t,
+                        // A failed handshake is the peer's business, not an error here.
+                        Err(_) => return,
+                    };
+                    let service = service_fn(move |req| handle(req, ctx.clone()));
+                    // ALPN already chose the protocol during the handshake, so the
+                    // builder is told which one rather than sniffing for it.
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+/// Builds a rustls server config from PEM files on disk.
+///
+/// `alpn` is a comma-separated preference list, most preferred first, e.g.
+/// `"h2,http/1.1"`. Empty advertises nothing, which leaves HTTP/1.1.
+fn build_tls_config(
+    cert_path: &str,
+    key_path: &str,
+    alpn: &str,
+) -> Option<rustls::ServerConfig> {
+    let certs = {
+        let file = std::fs::File::open(cert_path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?
+    };
+    if certs.is_empty() {
+        return None;
+    }
+    let key = {
+        let file = std::fs::File::open(key_path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        rustls_pemfile::private_key(&mut reader).ok()??
+    };
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()?;
+
+    config.alpn_protocols = alpn
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.as_bytes().to_vec())
+        .collect();
+    Some(config)
+}
+
+/// Starts a TLS listener. Returns NULL when the address is unusable or the
+/// certificate and key cannot be loaded.
+///
+/// Same request callback contract as [`hyper4k_server_start`]; the only
+/// difference is that the transport is encrypted and the protocol comes from
+/// ALPN rather than from sniffing the preface.
+///
+/// # Safety
+/// `host`, `cert_path`, `key_path` and `alpn` must be NUL-terminated or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_server_start_tls(
+    host: *const c_char,
+    port: u16,
+    cert_path: *const c_char,
+    key_path: *const c_char,
+    alpn: *const c_char,
+    on_request: Hyper4kRequestCallback,
+    user_data: *mut c_void,
+) -> *mut Hyper4kServer {
+    let as_str = |p: *const c_char, fallback: &str| -> String {
+        if p.is_null() {
+            fallback.to_owned()
+        } else {
+            CStr::from_ptr(p).to_str().unwrap_or(fallback).to_owned()
+        }
+    };
+    let host = as_str(host, "0.0.0.0");
+    let cert_path = as_str(cert_path, "");
+    let key_path = as_str(key_path, "");
+    let alpn = as_str(alpn, "http/1.1");
+
+    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let tls_config = match build_tls_config(&cert_path, &key_path, &alpn) {
+        Some(c) => c,
+        None => return std::ptr::null_mut(),
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let listener = match runtime.block_on(async { TcpListener::bind(addr).await }) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let ctx = Arc::new(CallbackCtx {
+        cb: on_request,
+        user_data,
     });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    runtime.spawn(serve_tls(listener, acceptor, ctx, shutdown_rx));
 
     Box::into_raw(Box::new(Hyper4kServer {
         _runtime: runtime,
@@ -659,6 +810,9 @@ unsafe fn parse_headers(ptr: *const u8, len: usize) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
+mod server_tls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         active_streams, hyper4k_respond, hyper4k_response_begin, hyper4k_response_finish,
@@ -683,7 +837,7 @@ mod tests {
     }
 
     /// Picks a free port and releases it for the server under test.
-    fn free_port() -> u16 {
+    pub(crate) fn free_port() -> u16 {
         let probe = StdTcpListener::bind("127.0.0.1:0").expect("allocate test port");
         let port = probe.local_addr().expect("test address").port();
         drop(probe);
@@ -1159,7 +1313,7 @@ mod tests {
         unsafe { hyper4k_server_stop(server) };
     }
 
-    extern "C" fn test_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
+    pub(crate) extern "C" fn test_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
         let body = b"hello from hyper4k";
         let headers = b"Content-Type: text/plain\nConnection: close\n";
         unsafe {

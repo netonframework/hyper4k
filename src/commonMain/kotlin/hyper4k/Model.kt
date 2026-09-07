@@ -184,3 +184,17 @@ typealias Hyper4kHandler = suspend (Hyper4kRequest) -> Hyper4kResponse
  */
 typealias Hyper4kStreamingHandler =
     suspend (request: Hyper4kRequest, channel: Hyper4kResponseChannel) -> Hyper4kResponse
+
+/**
+ * TLS for a listener.
+ *
+ * [alpnProtocols] is the server's preference order, most preferred first. The
+ * handshake picks the first entry the client also offers, so `["h2", "http/1.1"]`
+ * serves HTTP/2 to clients that speak it and HTTP/1.1 to the rest. An empty list
+ * advertises no ALPN at all, which leaves HTTP/1.1.
+ */
+class Hyper4kTls(
+    val certificatePath: String,
+    val privateKeyPath: String,
+    val alpnProtocols: List<String> = listOf("http/1.1"),
+)

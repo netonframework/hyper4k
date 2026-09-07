@@ -287,6 +287,23 @@ Hyper4kServer *hyper4k_server_start(const char *host,
                                    void *user_data);
 
 /*
+ * 启动 TLS 服务器。地址不可用、或证书/私钥读不出来时返回 NULL。
+ *
+ * cert_path / key_path 指向 PEM 文件。alpn 是逗号分隔的偏好列表，最偏好在前，
+ * 例如 "h2,http/1.1"；传空串则不通告 ALPN（即 HTTP/1.1）。协议由握手期的 ALPN
+ * 决定，不再靠嗅探连接前言。
+ *
+ * 请求回调契约与 hyper4k_server_start 完全一致。
+ */
+Hyper4kServer *hyper4k_server_start_tls(const char *host,
+                                        uint16_t port,
+                                        const char *cert_path,
+                                        const char *key_path,
+                                        const char *alpn,
+                                        Hyper4kRequestCallback on_request,
+                                        void *user_data);
+
+/*
  * 完成一个请求（拷贝版）。返回 1 表示已交付，0 表示 responder 已失效或已经完成。
  * headers 与 body 在本调用内被拷贝，返回后你的缓冲即可释放。
  * headers 编码同请求：每行 "Name: Value\n"（可为空 -> 传 NULL,0）。

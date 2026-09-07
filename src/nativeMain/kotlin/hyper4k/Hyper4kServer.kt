@@ -10,6 +10,7 @@ import hyper4k.cinterop.hyper4k_response_begin
 import hyper4k.cinterop.hyper4k_response_finish
 import hyper4k.cinterop.hyper4k_response_write
 import hyper4k.cinterop.hyper4k_server_start
+import hyper4k.cinterop.hyper4k_server_start_tls
 import hyper4k.cinterop.hyper4k_server_stop
 import kotlinx.cinterop.*
 import kotlinx.coroutines.withContext
@@ -49,6 +50,8 @@ class Hyper4kServer(
     private val requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MILLIS,
     private val shutdownGraceMillis: Long = DEFAULT_SHUTDOWN_GRACE_MILLIS,
     private val failureResponse: (status: Int, message: String) -> Hyper4kResponse = ::defaultFailureResponse,
+    /** Null serves cleartext; non-null terminates TLS on this listener. */
+    private val tls: Hyper4kTls? = null,
 ) {
     private var server: CPointer<cnames.structs.Hyper4kServer>? = null
     private var stateRef: StableRef<AsyncRequestDispatcher>? = null
@@ -88,17 +91,36 @@ class Hyper4kServer(
         )
         val ref = StableRef.create(state)
         stateRef = ref
-        val startedServer = hyper4k_server_start(
-            host = host,
-            port = port.toUShort(),
-            on_request = staticCFunction(::onRequest),
-            user_data = ref.asCPointer(),
-        )
+        val startedServer = if (tls == null) {
+            hyper4k_server_start(
+                host = host,
+                port = port.toUShort(),
+                on_request = staticCFunction(::onRequest),
+                user_data = ref.asCPointer(),
+            )
+        } else {
+            hyper4k_server_start_tls(
+                host = host,
+                port = port.toUShort(),
+                cert_path = tls.certificatePath,
+                key_path = tls.privateKeyPath,
+                alpn = tls.alpnProtocols.joinToString(","),
+                on_request = staticCFunction(::onRequest),
+                user_data = ref.asCPointer(),
+            )
+        }
         if (startedServer == null) {
             state.cancel()
             ref.dispose()
             stateRef = null
-            error("hyper4k_server_start failed for $host:$port (port in use or bind error)")
+            // The two failures look the same from here, so name both: a bad
+            // certificate path is far easier to make than a port clash.
+            val why = if (tls == null) {
+                "port in use or bind error"
+            } else {
+                "port in use, or certificate/key unreadable at ${tls.certificatePath} / ${tls.privateKeyPath}"
+            }
+            error("hyper4k server failed to start on $host:$port ($why)")
         }
         server = startedServer
     }
