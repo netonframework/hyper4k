@@ -57,14 +57,18 @@ class Hyper4kRequest(
         headersOrNull?.let { parsed ->
             return parsed.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
         }
-        val target = name.encodeToByteArray()
+        // HTTP field names are ASCII. Compare against the String directly:
+        // even a missing X-Request-Id must not allocate a temporary ByteArray.
+        // Keep the legacy byte comparison for callers supplying non-ASCII
+        // names through the public snapshot constructor.
+        val encoded = if (name.any { it.code > 0x7f }) name.encodeToByteArray() else null
         val raw = rawHeaderBytes
         var lineStart = 0
         while (lineStart < raw.size) {
             var lineEnd = lineStart
             while (lineEnd < raw.size && raw[lineEnd] != NEWLINE) lineEnd++
             val colon = indexOfColon(raw, lineStart, lineEnd)
-            if (colon > lineStart && matchesIgnoreCase(raw, lineStart, colon, target)) {
+            if (colon > lineStart && matchesIgnoreCase(raw, lineStart, colon, name, encoded)) {
                 var vs = colon + 1
                 while (vs < lineEnd && (raw[vs] == SPACE || raw[vs] == TAB)) vs++
                 var ve = lineEnd
@@ -90,12 +94,13 @@ class Hyper4kRequest(
         }
 
         /** ASCII 大小写不敏感比较；头名按 RFC 只能是 ASCII。 */
-        fun matchesIgnoreCase(raw: ByteArray, from: Int, to: Int, target: ByteArray): Boolean {
-            if (to - from != target.size) return false
+        fun matchesIgnoreCase(raw: ByteArray, from: Int, to: Int, name: String, encoded: ByteArray?): Boolean {
+            val length = encoded?.size ?: name.length
+            if (to - from != length) return false
             var i = 0
-            while (i < target.size) {
+            while (i < length) {
                 val a = lower(raw[from + i])
-                val b = lower(target[i])
+                val b = lower(encoded?.get(i) ?: name[i].code.toByte())
                 if (a != b) return false
                 i++
             }

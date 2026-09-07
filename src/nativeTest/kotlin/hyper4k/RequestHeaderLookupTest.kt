@@ -74,4 +74,16 @@ class RequestHeaderLookupTest {
         assertEquals("中文值", req(raw).header("X-Name"))
         bothAgree(raw, "X-Name")
     }
+
+    @Test
+    fun snapshotConstructorPreservesNonAsciiNameLookup() {
+        // Network field names are ASCII, but the public snapshot constructor
+        // previously allowed arbitrary UTF-8 names. Keep that behavior.
+        val request = req("X-名字: value\nX-Name: ascii\n")
+        assertEquals("value", request.header("x-名字"))
+        assertNull(request.header("x-名"))
+        assertEquals("ascii", request.header("X-NAME"))
+        assertEquals("value", request.headers["X-名字"]?.first())
+        assertEquals("value", request.header("x-名字"))
+    }
 }

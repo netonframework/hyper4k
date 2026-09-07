@@ -290,20 +290,22 @@ async fn handle(
     req: Request<Incoming>,
     ctx: Arc<CallbackCtx>,
 ) -> Result<Response<Hyper4kBody>, Infallible> {
-    let method = req.method().as_str().to_owned();
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-
-    let mut header_buf = String::new();
-    for (name, value) in req.headers() {
-        header_buf.push_str(name.as_str());
-        header_buf.push_str(": ");
-        header_buf.push_str(value.to_str().unwrap_or(""));
-        header_buf.push('\n');
-    }
+    // Move the parsed method/URI instead of allocating strings for Kotlin to
+    // copy again. Release the original headers/extensions before reading body.
+    let (method, uri, header_buf, incoming) = {
+        let (head, incoming) = req.into_parts();
+        let mut header_buf = String::new();
+        for (name, value) in &head.headers {
+            header_buf.push_str(name.as_str());
+            header_buf.push_str(": ");
+            header_buf.push_str(value.to_str().unwrap_or(""));
+            header_buf.push('\n');
+        }
+        (head.method, head.uri, header_buf, incoming)
+    };
 
     // v1：聚合 body（流式版本未来用 Incoming 的 frame stream 实现）
-    let body: Bytes = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES)
+    let body: Bytes = match http_body_util::Limited::new(incoming, MAX_REQUEST_BODY_BYTES)
         .collect()
         .await
     {
@@ -315,14 +317,14 @@ async fn handle(
 
     let (responder, rx, _pending) = register_response();
 
-    // 这些局部变量（method/path/query/header_buf/body）在 await 期间保持存活，
-    // 因此借用给 Kotlin 的切片在 hyper4k_respond 被调用前始终有效。
+    // Keep the backing storage alive until the response is delivered, as before.
+    // Kotlin takes its own snapshot before returning from the callback.
     IN_CALLBACK.set(responder);
     {
         let creq = Hyper4kRequest {
-            method: Hyper4kSlice::borrow(method.as_bytes()),
-            path: Hyper4kSlice::borrow(path.as_bytes()),
-            query: Hyper4kSlice::borrow(query.as_bytes()),
+            method: Hyper4kSlice::borrow(method.as_str().as_bytes()),
+            path: Hyper4kSlice::borrow(uri.path().as_bytes()),
+            query: Hyper4kSlice::borrow(uri.query().unwrap_or("").as_bytes()),
             headers: Hyper4kSlice::borrow(header_buf.as_bytes()),
             body: Hyper4kSlice::borrow(&body),
             responder,
@@ -1433,6 +1435,66 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 201 Created"), "{response}");
         assert!(response.ends_with("hello from hyper4k"), "{response}");
+        unsafe { hyper4k_server_stop(server) };
+    }
+
+    extern "C" fn snapshot_handler(_user_data: *mut c_void, request: *const Hyper4kRequest) {
+        let request = unsafe { &*request };
+        let mut snapshot = Vec::new();
+        for field in [
+            &request.method,
+            &request.path,
+            &request.query,
+            &request.body,
+        ] {
+            if field.len != 0 {
+                snapshot
+                    .extend_from_slice(unsafe { std::slice::from_raw_parts(field.ptr, field.len) });
+            }
+            snapshot.push(b'\n');
+        }
+        let responder = request.responder;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            unsafe {
+                hyper4k_respond(
+                    responder,
+                    200,
+                    std::ptr::null(),
+                    0,
+                    snapshot.as_ptr(),
+                    snapshot.len(),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn request_fields_survive_an_async_snapshot_response() {
+        let probe = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let host = CString::new("127.0.0.1").unwrap();
+        let server = unsafe {
+            hyper4k_server_start(host.as_ptr(), port, snapshot_handler, std::ptr::null_mut())
+        };
+        assert!(!server.is_null());
+        // Exercise non-empty and empty query/body independently of method/path.
+        for (wire, expected) in [
+            ("POST /a%20b?q=%E4%B8%AD&x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload",
+             "POST\n/a%20b\nq=%E4%B8%AD&x=1\npayload\n"),
+            ("GET /empty HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+             "GET\n/empty\n\n\n"),
+        ] {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.write_all(wire.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert_eq!(response.split_once("\r\n\r\n").unwrap().1, expected);
+        }
         unsafe { hyper4k_server_stop(server) };
     }
 

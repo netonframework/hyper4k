@@ -56,3 +56,21 @@ class EncodeHeadersTest {
         )
     }
 }
+
+class EncodeHeadersSizingTest {
+    /** The buffer must be sized exactly: no trailing slack, no second copy. */
+    @Test
+    fun theEncodedBlockHasNoTrailingByte() {
+        val one = encodeHeadersForTest(mapOf("A" to listOf("b")))
+        assertEquals("A: b".length, one.size)
+        val two = encodeHeadersForTest(mapOf("A" to listOf("b"), "C" to listOf("d")))
+        assertEquals("A: b\nC: d".length, two.size)
+        val repeated = encodeHeadersForTest(mapOf("S" to listOf("1", "2", "3")))
+        assertEquals("S: 1\nS: 2\nS: 3".length, repeated.size)
+    }
+
+    @Test
+    fun aNameWithOnlyEmptyValueListEncodesToNothing() {
+        assertEquals(0, encodeHeadersForTest(mapOf("Empty" to emptyList())).size)
+    }
+}

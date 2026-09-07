@@ -440,15 +440,23 @@ private fun encodeHeaders(headers: Map<String, List<String>>): ByteArray {
     // A byte-per-char copy would silently truncate anything wider, so the check
     // is not an optimisation detail — a Content-Disposition filename is enough
     // to hit it, and the fallback below keeps that correct.
+    // Exact size: "Name: Value" per line, and a newline *between* lines only.
+    // Counting one newline per line over-allocated by a byte, which made the
+    // `copyOf` at the end run on every response — a second allocation and a
+    // full copy of the block, for nothing.
     var size = 0
+    var lines = 0
     var asciiOnly = true
     for ((name, values) in headers) {
         if (!name.isAscii()) asciiOnly = false
         for (value in values) {
             if (!value.isAscii()) asciiOnly = false
-            size += name.length + 2 + value.length + 1
+            size += name.length + 2 + value.length
+            lines++
         }
     }
+    if (lines == 0) return ByteArray(0)
+    size += lines - 1
     if (!asciiOnly) {
         val out = StringBuilder(size)
         for ((name, values) in headers) {
@@ -473,7 +481,8 @@ private fun encodeHeaders(headers: Map<String, List<String>>): ByteArray {
             for (i in value.indices) out[at++] = value[i].code.toByte()
         }
     }
-    return if (at == out.size) out else out.copyOf(at)
+    check(at == out.size) { "header block size mismatch: wrote $at of ${out.size}" }
+    return out
 }
 
 private fun String.isAscii(): Boolean {
