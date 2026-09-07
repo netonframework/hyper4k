@@ -431,15 +431,62 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
  */
 private fun encodeHeaders(headers: Map<String, List<String>>): ByteArray {
     if (headers.isEmpty()) return ByteArray(0)
-    val out = StringBuilder(headers.size * 32)
+
+    // Straight into bytes when everything is ASCII, which is what header names
+    // and values are in practice. Building a String first and encoding it
+    // afterwards walked the whole block twice and left the intermediate String
+    // behind, on every response.
+    //
+    // A byte-per-char copy would silently truncate anything wider, so the check
+    // is not an optimisation detail — a Content-Disposition filename is enough
+    // to hit it, and the fallback below keeps that correct.
+    var size = 0
+    var asciiOnly = true
     for ((name, values) in headers) {
+        if (!name.isAscii()) asciiOnly = false
         for (value in values) {
-            if (out.isNotEmpty()) out.append('\n')
-            out.append(name).append(": ").append(value)
+            if (!value.isAscii()) asciiOnly = false
+            size += name.length + 2 + value.length + 1
         }
     }
-    return out.toString().encodeToByteArray()
+    if (!asciiOnly) {
+        val out = StringBuilder(size)
+        for ((name, values) in headers) {
+            for (value in values) {
+                if (out.isNotEmpty()) out.append('\n')
+                out.append(name).append(": ").append(value)
+            }
+        }
+        return out.toString().encodeToByteArray()
+    }
+
+    val out = ByteArray(size)
+    var at = 0
+    var first = true
+    for ((name, values) in headers) {
+        for (value in values) {
+            if (!first) out[at++] = NEWLINE_BYTE
+            first = false
+            for (i in name.indices) out[at++] = name[i].code.toByte()
+            out[at++] = COLON_BYTE
+            out[at++] = SPACE_BYTE
+            for (i in value.indices) out[at++] = value[i].code.toByte()
+        }
+    }
+    return if (at == out.size) out else out.copyOf(at)
 }
+
+private fun String.isAscii(): Boolean {
+    for (i in indices) if (this[i].code >= 0x80) return false
+    return true
+}
+
+/** Test seam: [encodeHeaders] is file-private and has no other caller in the module. */
+internal fun encodeHeadersForTest(headers: Map<String, List<String>>): ByteArray = encodeHeaders(headers)
+
+private const val NEWLINE_BYTE: Byte = 0x0A
+private const val COLON_BYTE: Byte = 0x3A
+private const val SPACE_BYTE: Byte = 0x20
 
 /**
  * Runs [block] without arming a timer unless it actually suspends.

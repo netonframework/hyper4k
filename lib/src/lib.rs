@@ -21,6 +21,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -98,14 +99,14 @@ unsafe impl Sync for CallbackCtx {}
 
 struct ResponseData {
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: HeaderMap,
     body: Vec<u8>,
 }
 
 /// Head of a streaming response: status and headers go out now, body arrives over `rx`.
 struct StreamStart {
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: HeaderMap,
     rx: mpsc::Receiver<Bytes>,
 }
 
@@ -267,8 +268,8 @@ fn build_response(delivery: Delivery) -> Response<Hyper4kBody> {
     };
 
     let mut builder = Response::builder().status(status);
-    for (k, v) in &headers {
-        builder = builder.header(k.as_str(), v.as_str());
+    if let Some(dst) = builder.headers_mut() {
+        *dst = headers;
     }
     builder
         .body(body)
@@ -629,7 +630,7 @@ fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
         // 落回通道，handle() 取不到槽时会 await 它。
         return deliver_through_channel(responder, Delivery::Buffered(ResponseData {
             status: 500,
-            headers: Vec::new(),
+            headers: HeaderMap::new(),
             body: b"hyper4k: sync response slot busy".to_vec(),
         }));
     }
@@ -784,29 +785,54 @@ pub unsafe extern "C" fn hyper4k_server_stop(server: *mut Hyper4kServer) {
 // 辅助
 // ---------------------------------------------------------------------------
 
-/// 解析 "Name: Value\n" 文本块为 (name, value) 列表。
-unsafe fn parse_headers(ptr: *const u8, len: usize) -> Vec<(String, String)> {
+/// 解析 "Name: Value\n" 文本块，直接产出 `HeaderMap`。
+///
+/// 早先这里为每个头分配两个 `String`，`build_response` 再拿它们的 `&str` 去建
+/// header——而 `HeaderName`/`HeaderValue` 本来就要自己拷一份。那两个 String 是
+/// 纯中间产物，每个响应白付两次分配。现在从字节切片直接构造，只留必要的那一次。
+unsafe fn parse_headers(ptr: *const u8, len: usize) -> HeaderMap {
+    let mut map = HeaderMap::new();
     if ptr.is_null() || len == 0 {
-        return Vec::new();
+        return map;
     }
     let raw = std::slice::from_raw_parts(ptr, len);
-    let text = std::str::from_utf8(raw).unwrap_or("");
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim_end_matches('\r');
-            if line.is_empty() {
-                return None;
-            }
-            let idx = line.find(':')?;
-            let name = line[..idx].trim().to_owned();
-            let value = line[idx + 1..].trim().to_owned();
-            if name.is_empty() {
-                None
-            } else {
-                Some((name, value))
-            }
-        })
-        .collect()
+    for line in raw.split(|b| *b == b'\n') {
+        let line = match line.strip_suffix(b"\r") {
+            Some(l) => l,
+            None => line,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let Some(idx) = line.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        let name = trim_ascii(&line[..idx]);
+        let value = trim_ascii(&line[idx + 1..]);
+        if name.is_empty() {
+            continue;
+        }
+        // 无效的头名或值直接跳过，和之前 filter_map 的行为一致：坏的一行不该
+        // 让整个响应失败。
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name),
+            HeaderValue::from_bytes(value),
+        ) else {
+            continue;
+        };
+        map.append(name, value);
+    }
+    map
+}
+
+fn trim_ascii(mut b: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = b {
+        if first.is_ascii_whitespace() { b = rest } else { break }
+    }
+    while let [rest @ .., last] = b {
+        if last.is_ascii_whitespace() { b = rest } else { break }
+    }
+    b
 }
 
 #[cfg(test)]
@@ -844,16 +870,25 @@ mod tests {
         port
     }
 
+    /// Collects the map back into pairs so these read the way they did when
+    /// `parse_headers` returned a `Vec`; order is preserved per name.
+    fn pairs(map: &hyper::header::HeaderMap) -> Vec<(String, String)> {
+        map.iter()
+            .map(|(n, v)| (n.to_string(), v.to_str().unwrap().to_owned()))
+            .collect()
+    }
+
     #[test]
     fn parses_header_block() {
         let raw = b"Content-Type: application/json\nX-Request-Id: abc\r\n";
         let headers = unsafe { parse_headers(raw.as_ptr(), raw.len()) };
 
         assert_eq!(
-            headers,
+            pairs(&headers),
             vec![
-                ("Content-Type".to_owned(), "application/json".to_owned()),
-                ("X-Request-Id".to_owned(), "abc".to_owned()),
+                // HeaderName lowercases, which is what goes on the wire anyway.
+                ("content-type".to_owned(), "application/json".to_owned()),
+                ("x-request-id".to_owned(), "abc".to_owned()),
             ]
         );
     }
@@ -863,7 +898,37 @@ mod tests {
         let raw = b"invalid\n: empty-name\nValid: value\n";
         let headers = unsafe { parse_headers(raw.as_ptr(), raw.len()) };
 
-        assert_eq!(headers, vec![("Valid".to_owned(), "value".to_owned())]);
+        assert_eq!(pairs(&headers), vec![("valid".to_owned(), "value".to_owned())]);
+    }
+
+    /// A name or value that HTTP does not allow must drop that line, not the
+    /// whole response: the rest of the block still has to go out.
+    #[test]
+    fn a_malformed_name_or_value_drops_only_its_own_line() {
+        let raw = b"Good: one\nBad Name: two\nAlso-Good: three\n";
+        let headers = unsafe { parse_headers(raw.as_ptr(), raw.len()) };
+        assert_eq!(
+            pairs(&headers),
+            vec![
+                ("good".to_owned(), "one".to_owned()),
+                ("also-good".to_owned(), "three".to_owned()),
+            ],
+            "a space in the name is not a legal header; the others must survive"
+        );
+    }
+
+    /// The same name twice is two values, not one overwriting the other —
+    /// Set-Cookie depends on it.
+    #[test]
+    fn a_repeated_name_keeps_every_value_in_order() {
+        let raw = b"Set-Cookie: a=1\nSet-Cookie: b=2\n";
+        let headers = unsafe { parse_headers(raw.as_ptr(), raw.len()) };
+        let values: Vec<_> = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["a=1", "b=2"]);
     }
 
     #[test]
