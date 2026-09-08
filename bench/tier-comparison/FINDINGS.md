@@ -75,3 +75,30 @@ dispatcher building per-request maps, dominated by query-parameter parsing into
 a HashMap<String,List<String>>. It is load-bearing (handlers read the params),
 so it needs a lighter parse rather than removal. Next target, with the same
 sample → change → A/B discipline.
+
+## Second single-variable result (query-param scan) — confirmed, bigger
+
+Hotspot: dispatcher HashMap ops ~4.3% of tier3 (near-absent in tier2.5B) — the
+per-request query map (LinkedHashMap + a MutableList per key + decoded strings),
+built eagerly for ArgsView even when the handler reads a couple of params by name.
+
+Change (neton 6421660): `queryParam(name)` and `args.first/all` scan the raw
+query string; the full map stays lazy for iteration. Cross-checked vs the map
+parse across shapes.
+
+Clean-box A/B (Fedora, WARN, 4 interleaved rounds), on top of the method fix:
+
+| | per-req CPU (4 rounds) | rps |
+|---|---|---|
+| method only | 33.4 / 33.5 / 33.1 / 33.2 µs | ~41.0k |
+| + query scan | 31.1 / 31.4 / 31.4 / 31.8 µs | ~42.6k |
+
+Every "scan" round below every "method" round: a clean ~5.7% (≈1.9 µs/req)
+improvement, again matching the hotspot's sampled share (~4.3% > the method
+fix's ~0.85%, and this win is ~5x larger). Cumulative over both changes:
+tier3 ~34 → ~31.4 µs, ~7.6%.
+
+Note on "keep a resident map": a single shared mutable map cannot hold
+per-request-varying params under concurrency without racing. Scanning (or
+per-request build) is the safe way to the same zero-shared-state goal; scanning
+also avoids the allocation entirely for keyed reads.
