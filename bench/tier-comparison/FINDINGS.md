@@ -46,3 +46,32 @@ Stable across runs; tier2.5B measured the same (17.6–17.7 µs) at a 10 MB and 
    request-build / routing / envelope / GC before changing anything.
 2. Only then pick one hotspot; use the dispatch microbench to iterate the small
    change; confirm the gain on the full HTTP A/B, not the microbench.
+
+## First single-variable result (confirmed, small)
+
+Hotspot from sampling: `method.toHttpMethod()` ran `uppercase()` + enum
+`valueOf` per request (`uppercaseCodePoint` ~0.85% of tier3 samples). Change:
+match upper-case methods verbatim, fall back for odd casing (neton commit
+691e4fd).
+
+Clean-box A/B, WARN, interleaved 4 rounds (before = tier3, after = tier3b, only
+this change differs), per-request process CPU:
+
+| | per-req CPU (4 rounds) | rps |
+|---|---|---|
+| before | 34.0 / 33.8 / 33.8 / 34.1 µs | ~39.9k |
+| after  | 33.5 / 33.5 / 33.1 / 33.6 µs | ~40.8k |
+
+Every "after" round is below every "before" round (max after 33.6 < min before
+33.8) — a clean, reproducible ~1.2% (≈0.4 µs/req) improvement, matching the
+hotspot's ~0.85% sampled share. Small, but it confirms the pipeline: sample →
+one change → end-to-end gain that matches the predicted size. This is the
+opposite of the earlier microbench gains that did not translate.
+
+## Biggest remaining hotspot (not yet changed)
+
+HashMap operations are ~4.3% of tier3 and near-absent in tier2.5B — the
+dispatcher building per-request maps, dominated by query-parameter parsing into
+a HashMap<String,List<String>>. It is load-bearing (handlers read the params),
+so it needs a lighter parse rather than removal. Next target, with the same
+sample → change → A/B discipline.
