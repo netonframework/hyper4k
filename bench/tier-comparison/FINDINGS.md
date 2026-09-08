@@ -1,40 +1,47 @@
-# Three-tier per-request cost, measured
+# Per-request cost by tier — what is defensible, and what is not
 
-Reproducible on one Linux box (interleaved, same load, same box). Corrects
-earlier macOS-sample guesses, which were not trustworthy.
+Measured on one small Linux box. Read the limits before quoting any number.
 
-## Method
+## Hard limits on this measurement
 
-- Box: Rocky Linux 9, 4 cores (a small VM — NOT the arena's 64 cores).
-- Load: `wrk -t4 -c256 -d15s` on `/baseline11?a=3&b=4` (1-byte-ish sum response).
-- Per-request CPU = process CPU time delta (`/proc/PID/stat` utime+stime) over
-  the window ÷ requests completed. Interleaved rounds; see `run.sh`.
-- Real sampling: `perf record -e cpu-clock` (software event; hardware `cycles` is
-  unavailable on this VM). ~1.1M samples. `perf report -e cycles` yields none.
+- **The box is shared.** It also runs privchat-server, a geario ntex server, and
+  redis. Heavy load tests on 4 cores contend with those, so **throughput and any
+  GC-sensitive tier are contaminated**. Do not trust rps here.
+- **4 cores, not the arena's 64.** Absolute costs and the network-stack share
+  differ there. Only the *relative* per-tier deltas are a localization clue.
+- **Hardware `cycles` PMU is unavailable** (VM); `perf -e cpu-clock` works
+  (~1.1M samples) and showed the kernel network stack, softirq, plus this VM's
+  nftables/SELinux dominating — i.e. app cost is a minority *on this box*.
 
-## Tiers
+## Defensible: per-request *process* CPU (utime+stime of our own PID)
 
-| Tier | what | rps | per-request CPU |
-|------|------|-----|-----------------|
-| 1 | pure hyper (Rust), no ABI, no Kotlin | ~200–252k | 7.5–9.6 µs |
-| 2 | hyper4k engine + C ABI + native Rust callback (no Kotlin runtime) | ~215–219k | 8.9–9.0 µs |
-| 3 | full Neton (Kotlin/Native: dispatcher, FFI copies, coroutine, GC) | ~102–109k | 24–25 µs |
+This metric charges only our process's CPU, so co-tenancy inflates it less than
+throughput. Stable across interleaved rounds:
 
-## What it shows
+| Tier | what | per-request CPU |
+|------|------|-----------------|
+| 1 | pure hyper (Rust) | ~7 µs |
+| 2 | hyper4k C ABI + native Rust callback | ~9 µs |
+| 2.5B | Kotlin `Hyper4kServer` handler (FFI copy + coroutine + GC), no Neton dispatcher | ~15 µs |
 
-- **Tier1 ≈ Tier2.** The hyper4k C ABI, responder, oneshot and DashMap
-  registration add essentially nothing over pure hyper. The engine is not the
-  cost.
-- **Tier2 → Tier3 is +~16 µs/request**, entirely the Kotlin/Native layer: the
-  per-request FFI copies (method/path/query/body), the coroutine dispatch, GC,
-  and the neton dispatcher/routing. This is ~2/3 of the full per-request cost and
-  is where optimization has room.
+- **Tier1 → Tier2: +~2 µs.** The C ABI + responder + oneshot/DashMap has a small
+  but real cost. (Earlier "zero cost" is withdrawn.)
+- **Tier2 → Tier2.5B: +~6 µs.** Crossing into Kotlin/Native per request — the FFI
+  copies of method/path/query/body, the coroutine dispatch, and GC — roughly
+  doubles per-request CPU over the raw ABI. This is real and in our code.
 
-## Not claimed
+## NOT established
 
-- This is a 4-core VM, not the 64-core arena; absolute numbers and the
-  network-stack share differ there. The *relative* engine-vs-Kotlin split is the
-  transferable finding.
-- The 16 µs is not yet split among FFI copy / coroutine / GC / dispatcher. That
-  needs a Tier 2.5 (minimal Kotlin callback) before any single-variable fix.
-- No "architecture floor" conclusion. Earlier claims of one are withdrawn.
+- **Tier3 (full Neton dispatcher) is not reliably measured here.** On this shared
+  box the GC'd full path collapsed under contention (wildly variable, ~100+ µs);
+  those numbers are contamination, not the dispatcher's true cost. The
+  dispatcher's added cost over Tier2.5B is unknown until measured on a clean,
+  isolated box or on the arena.
+- No "architecture floor" claim. No split of the Kotlin cost into exact
+  FFI/coroutine/GC shares — GC appears at several tiers and is not isolated.
+
+## Next
+
+1. Get a clean, isolated box (or a quiet window) and measure Tier3 comparably.
+2. Only then pick one hotspot inside the Kotlin path for a single-variable,
+   before/after experiment.
