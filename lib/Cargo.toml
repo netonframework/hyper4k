@@ -36,6 +36,12 @@ rcgen = "0.13"
 time = "0.3"
 tokio-stream = "0.1"
 futures-core = "0.3"
+# Low-level h2 client for controlled flow-control protocol tests: it lets a test
+# set a small receive window and release capacity by hand, which neither hyper's
+# client nor a load tool exposes.
+h2 = "0.4"
+http = "1"
+futures-util = "0.3"
 
 [[bench]]
 name = "three_layer"

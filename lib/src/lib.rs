@@ -841,6 +841,9 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
 mod server_tls_tests;
 
 #[cfg(test)]
+mod h2_flow_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         active_streams, hyper4k_respond, hyper4k_response_begin, hyper4k_response_finish,
