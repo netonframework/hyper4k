@@ -1,3 +1,5 @@
+import kotlin.native.runtime.GC
+import kotlin.native.runtime.NativeRuntimeApi
 import hyper4k.Hyper4kServer
 import hyper4k.Hyper4kResponse
 import kotlinx.coroutines.runBlocking
@@ -8,8 +10,12 @@ import kotlinx.cinterop.toKString
 
 // Tier 2.5B: through Hyper4kServer's request conversion + coroutine dispatch,
 // but NOT the Neton dispatcher. Same sum as the other tiers.
-@OptIn(ExperimentalForeignApi::class)
+@OptIn(ExperimentalForeignApi::class, NativeRuntimeApi::class)
 fun main() {
+    // Same GC floor as the Tier3 bench build, so the 2.5B→3 delta is not a GC
+    // policy difference. WARN logging matches too (this tier logs nothing).
+    GC.minHeapBytes = 256L * 1024 * 1024
+    GC.targetHeapBytes = 512L * 1024 * 1024
     val port = getenv("HYPER4K_SUM_PORT")?.toKString()?.toIntOrNull() ?: 19092
     val server = Hyper4kServer(host = "0.0.0.0", port = port, requestTimeoutMillis = 0)
     runBlocking {

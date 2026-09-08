@@ -1,48 +1,45 @@
-# Per-request cost by tier — clean-box measurement
+# Per-request cost by tier — clean-box, GC-aligned
 
-Measured on a **dedicated** Fedora 44 box (2 cores, 1.6 GB + swap, nothing else
-running), so throughput and per-request CPU are trustworthy — unlike the earlier
-shared box. Config matches production (`[logging] level = WARN`, no access log).
+Dedicated Fedora 44 box (2 cores, 1.6 GB + swap, nothing else running). Both
+Kotlin tiers use the SAME 256 MB GC floor and WARN logging, so their delta is not
+a GC-policy or logging artifact. `run.sh` in this directory is the exact harness;
+each run saves per-tier per-round wrk output, binary hashes, config, request
+errors, swap pages and RSS under /tmp/tierbench/<ts>/.
 
-## Method
+## Results (per-request process CPU: our PID's utime+stime ÷ requests, wrk -t1 -c128)
 
-- Per-request CPU = our process's utime+stime delta over a 15s `wrk -t1 -c128`
-  window ÷ requests. Warm-up first. One tier at a time, each measured on its own
-  clean process. Cross-checked against the earlier shared box (tier1/2 agreed).
-- All tiers compute the same sum a+b and return it as text.
+| Tier | what | per-req CPU | delta to previous |
+|------|------|-------------|-------------------|
+| 1 | pure hyper (Rust) | ~7.7 µs | — |
+| 2 | hyper4k C ABI + native Rust callback | ~9.7 µs | +2.0 µs |
+| 2.5B | Kotlin `Hyper4kServer` handler, no Neton dispatcher (256 MB GC) | ~17.7 µs | +8.0 µs |
+| 3 | full Neton dispatcher (256 MB GC, WARN) | ~34–35 µs | +16–17 µs |
 
-## Results (per-request CPU)
+Stable across runs; tier2.5B measured the same (17.6–17.7 µs) at a 10 MB and a
+256 MB GC floor, so the floor is not what separates it from tier3.
 
-| Tier | what | per-req CPU | added by this layer |
-|------|------|-------------|---------------------|
-| 1 | pure hyper (Rust) | 7.7 µs | — |
-| 2 | hyper4k C ABI + native Rust callback | 9.7 µs | +2.0 µs (C ABI + responder) |
-| 2.5B | Kotlin `Hyper4kServer` handler, no Neton dispatcher | 17.6 µs | +7.9 µs (FFI copies, coroutine, GC) |
-| 3 | full Neton dispatcher | 33.8 µs | +16.2 µs (routing, request build, envelope, security, observability) |
+## What this supports (and what it does not)
 
-## What this establishes
+- **hyper4k over pure hyper is +2 µs — ~26% of tier1, not "free".** Low priority
+  to optimize, but not proven negligible.
+- **Crossing into Kotlin/Native is +8 µs** (FFI copies, coroutine, GC).
+- **The full Neton path is +16–17 µs over the raw Kotlin server.** This is the
+  *difference between two tiers*, not the dispatcher's isolated self-time: it
+  still bundles request conversion, response envelope, routing, security checks,
+  GC and scheduling. It is the strongest candidate for where to look next, not a
+  finished attribution.
 
-- **The engine is cheap.** hyper4k over pure hyper is +2 µs; the C ABI /
-  responder / oneshot / DashMap is not the cost.
-- **Crossing into Kotlin/Native is +8 µs.** FFI copies of method/path/query/body,
-  the coroutine dispatch, and GC.
-- **The Neton dispatcher is the single biggest layer: +16 µs.** Routing lookup,
-  BufferedHttpRequest/ArgsView construction, the response-envelope path, the
-  security pipeline, and observability. It is ~half of the full per-request cost
-  and is entirely in `neton-http` — no FFI or lifetime hazards. This is the
-  highest-value target for a single-variable optimization.
+## Explicitly not claimed
 
-## Lessons paid for here
+- No "architecture floor". No claim the +16 µs is safe to change without care —
+  request-object reuse, coroutine context and response state can introduce
+  concurrency/lifetime bugs even though the code is Kotlin.
+- 2 cores, not the arena's 64. Contention and GC scalability can shift these
+  ratios there; only the layered ordering is expected to transfer.
 
-- A default (no application.conf) run logs `http.access` to stdout per request and
-  collapsed tier3 to ~630 rps. That is a config artifact, not a Neton bottleneck;
-  production runs WARN. Always match the production log level when measuring.
-- CPU-pinning (taskset) on a 4-core box starved the GC'd tier and distorted it;
-  a dedicated box measured cleanly without pinning.
+## Next (do not shortcut to the microbench)
 
-## Not claimed
-
-- 2 cores, not the arena's 64; absolute numbers differ there, the per-layer split
-  is the transferable finding.
-- The +16 µs dispatcher cost is not yet broken into routing vs envelope vs
-  request-build; that is the next measurement before optimizing.
+1. Sample tier3's real HTTP path (perf cpu-clock) to split the +16 µs into
+   request-build / routing / envelope / GC before changing anything.
+2. Only then pick one hotspot; use the dispatch microbench to iterate the small
+   change; confirm the gain on the full HTTP A/B, not the microbench.
