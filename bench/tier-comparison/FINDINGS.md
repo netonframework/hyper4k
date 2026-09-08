@@ -1,47 +1,48 @@
-# Per-request cost by tier — what is defensible, and what is not
+# Per-request cost by tier — clean-box measurement
 
-Measured on one small Linux box. Read the limits before quoting any number.
+Measured on a **dedicated** Fedora 44 box (2 cores, 1.6 GB + swap, nothing else
+running), so throughput and per-request CPU are trustworthy — unlike the earlier
+shared box. Config matches production (`[logging] level = WARN`, no access log).
 
-## Hard limits on this measurement
+## Method
 
-- **The box is shared.** It also runs privchat-server, a geario ntex server, and
-  redis. Heavy load tests on 4 cores contend with those, so **throughput and any
-  GC-sensitive tier are contaminated**. Do not trust rps here.
-- **4 cores, not the arena's 64.** Absolute costs and the network-stack share
-  differ there. Only the *relative* per-tier deltas are a localization clue.
-- **Hardware `cycles` PMU is unavailable** (VM); `perf -e cpu-clock` works
-  (~1.1M samples) and showed the kernel network stack, softirq, plus this VM's
-  nftables/SELinux dominating — i.e. app cost is a minority *on this box*.
+- Per-request CPU = our process's utime+stime delta over a 15s `wrk -t1 -c128`
+  window ÷ requests. Warm-up first. One tier at a time, each measured on its own
+  clean process. Cross-checked against the earlier shared box (tier1/2 agreed).
+- All tiers compute the same sum a+b and return it as text.
 
-## Defensible: per-request *process* CPU (utime+stime of our own PID)
+## Results (per-request CPU)
 
-This metric charges only our process's CPU, so co-tenancy inflates it less than
-throughput. Stable across interleaved rounds:
+| Tier | what | per-req CPU | added by this layer |
+|------|------|-------------|---------------------|
+| 1 | pure hyper (Rust) | 7.7 µs | — |
+| 2 | hyper4k C ABI + native Rust callback | 9.7 µs | +2.0 µs (C ABI + responder) |
+| 2.5B | Kotlin `Hyper4kServer` handler, no Neton dispatcher | 17.6 µs | +7.9 µs (FFI copies, coroutine, GC) |
+| 3 | full Neton dispatcher | 33.8 µs | +16.2 µs (routing, request build, envelope, security, observability) |
 
-| Tier | what | per-request CPU |
-|------|------|-----------------|
-| 1 | pure hyper (Rust) | ~7 µs |
-| 2 | hyper4k C ABI + native Rust callback | ~9 µs |
-| 2.5B | Kotlin `Hyper4kServer` handler (FFI copy + coroutine + GC), no Neton dispatcher | ~15 µs |
+## What this establishes
 
-- **Tier1 → Tier2: +~2 µs.** The C ABI + responder + oneshot/DashMap has a small
-  but real cost. (Earlier "zero cost" is withdrawn.)
-- **Tier2 → Tier2.5B: +~6 µs.** Crossing into Kotlin/Native per request — the FFI
-  copies of method/path/query/body, the coroutine dispatch, and GC — roughly
-  doubles per-request CPU over the raw ABI. This is real and in our code.
+- **The engine is cheap.** hyper4k over pure hyper is +2 µs; the C ABI /
+  responder / oneshot / DashMap is not the cost.
+- **Crossing into Kotlin/Native is +8 µs.** FFI copies of method/path/query/body,
+  the coroutine dispatch, and GC.
+- **The Neton dispatcher is the single biggest layer: +16 µs.** Routing lookup,
+  BufferedHttpRequest/ArgsView construction, the response-envelope path, the
+  security pipeline, and observability. It is ~half of the full per-request cost
+  and is entirely in `neton-http` — no FFI or lifetime hazards. This is the
+  highest-value target for a single-variable optimization.
 
-## NOT established
+## Lessons paid for here
 
-- **Tier3 (full Neton dispatcher) is not reliably measured here.** On this shared
-  box the GC'd full path collapsed under contention (wildly variable, ~100+ µs);
-  those numbers are contamination, not the dispatcher's true cost. The
-  dispatcher's added cost over Tier2.5B is unknown until measured on a clean,
-  isolated box or on the arena.
-- No "architecture floor" claim. No split of the Kotlin cost into exact
-  FFI/coroutine/GC shares — GC appears at several tiers and is not isolated.
+- A default (no application.conf) run logs `http.access` to stdout per request and
+  collapsed tier3 to ~630 rps. That is a config artifact, not a Neton bottleneck;
+  production runs WARN. Always match the production log level when measuring.
+- CPU-pinning (taskset) on a 4-core box starved the GC'd tier and distorted it;
+  a dedicated box measured cleanly without pinning.
 
-## Next
+## Not claimed
 
-1. Get a clean, isolated box (or a quiet window) and measure Tier3 comparably.
-2. Only then pick one hotspot inside the Kotlin path for a single-variable,
-   before/after experiment.
+- 2 cores, not the arena's 64; absolute numbers differ there, the per-layer split
+  is the transferable finding.
+- The +16 µs dispatcher cost is not yet broken into routing vs envelope vs
+  request-build; that is the next measurement before optimizing.
