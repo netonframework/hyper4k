@@ -2,7 +2,10 @@
 
 Dedicated Fedora 44 box (2 cores, 1.6 GB + swap, nothing else running). Both
 Kotlin tiers use the SAME 256 MB GC floor and WARN logging, so their delta is not
-a GC-policy or logging artifact. `run.sh` in this directory is the exact harness;
+a GC-policy or logging artifact. The numbers below were taken MANUALLY (one tier at a time, commands in the git
+history of this file); `run.sh` reproduces the same procedure but has not yet
+been shown to regenerate these exact numbers. Two close manual runs are a signal,
+not full validation. `run.sh` is the harness;
 each run saves per-tier per-round wrk output, binary hashes, config, request
 errors, swap pages and RSS under /tmp/tierbench/<ts>/.
 
