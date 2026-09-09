@@ -157,3 +157,31 @@ What this does and does not conclude:
   cross-thread allocation churn differ. That the pool helps there is a HYPOTHESIS,
   testable only by setting `http.contextPoolSize` on the arena entry and running
   /benchmark — not a conclusion. On current evidence, do not claim a benefit.
+
+## Context-pool A/B, valid this time (/work exercises all three objects)
+
+The first A/B used `/json`, whose handler returns a Map and never touches
+request or response — so the view and memory buffer were never created and the
+pool had nothing to reuse (GPT caught this). Redone on `/work`, a handler that
+reads `request.queryParam` (builds the view), reads `request.headers` (builds the
+header map) and writes via `context.response` (builds the memory buffer). Smoke
+confirmed it returns `id=42 ua=18`, i.e. the view is live. Same box, WARN,
+`wrk -t2 -c128 -d15s`, 4 interleaved rounds:
+
+| | per-req CPU (4 rounds) | rps | RSS |
+|---|---|---|---|
+| pool off | 39.57 / 39.13 / 38.85 / 38.80 µs | 33.2–34.0k | ~21 MB |
+| pool on (2048) | 39.22 / 38.99 / 38.98 / 39.25 µs | 34.0–34.5k | ~21 MB |
+
+Per-request CPU is flat (~39 µs both; off's 38.80 min is below on's 38.98). rps
+is ~1.3% higher with the pool but the ranges overlap (off 34.0k ≈ on 34.1k), so
+it is inside run-to-run noise, not a clean win like the method/query-scan changes
+were. RSS identical. Conclusion stands and is now on a valid measurement: at 2
+cores the context pool gives no meaningful benefit — the per-request cost is the
+work (header map, query scan, envelope, write), not the allocation of these three
+small short-lived objects, which K/N already reclaims cheaply.
+
+Not tested: 64-core arena GC scalability (hypothesis only). What this run does NOT
+claim: that "off = zero cost vs pre-change" — the plain path was itself
+restructured; proving byte-equivalence would need a pre-change baseline, not a
+toggle of the same binary.
