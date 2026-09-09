@@ -103,7 +103,7 @@ per-request-varying params under concurrency without racing. Scanning (or
 per-request build) is the safe way to the same zero-shared-state goal; scanning
 also avoids the allocation entirely for keyed reads.
 
-## json-h2c latency: reproduced, and it is NOT Nagle
+## json-h2c: reproduced *slower*, ruled OUT Nagle — but NOT root-caused
 
 The arena's json-h2c is far slower than baseline-h2c (and json-h2c/4096 records 0:
 3730% CPU, zero completed — busy, not deadlocked). Reproduced on the clean box
@@ -118,8 +118,12 @@ At 1x1 there is no ~40-200 ms floor, so **delayed-ACK/Nagle is not the cause and
 TCP_NODELAY would not fix json-h2c** (hypothesis tested and rejected before
 shipping). json-h2c is simply CPU-heavier per request (JSON serialization +
 larger body + more DATA frames): ~1.6x at 1x1, widening under load as the extra
-cost queues. At 4096 connections that cost tips the whole 5s window into "nothing
-completes" — which is what the arena's 0 is.
-
-Lever: reduce per-request cost (object reuse, cheaper serialization), the same
-line as the dispatcher work — not a network flag.
+cost queues. What this does and does not show:
+- Rules out delayed-ACK/Nagle as the cause (no ms-scale floor at 1x1), so
+  TCP_NODELAY would not fix json-h2c. Tested and rejected before shipping.
+- Shows json-h2c is heavier per request end-to-end and queues under load. It does
+  NOT prove per-request CPU is the *sole* cause, and it did NOT reproduce a zero:
+  16x32 still did ~9.3k rps. The arena's 0 was a 45s timeout with missing stats,
+  not "0 completed in 5s".
+- `json-h2c/4096` stays UNRESOLVED. That the object pool / cheaper serialization
+  would fix it is a hypothesis to test on the arena, not a conclusion.
