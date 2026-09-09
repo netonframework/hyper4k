@@ -104,7 +104,11 @@ rustTriples.forEach { (ktTarget, triple) ->
         // crate-type（cdylib）只服务本地开发/JVM。交叉编译时 .a 是纯归档、不经 linker，
         // 而 .so 要用目标平台的 linker——在 macOS 上 `cargo build` 会因为 ld 不认
         // --version-script 之类的 GNU 选项而失败，卡住的是我们根本不用的那个产物。
-        commandLine("cargo", "rustc", "--release", "--target", triple, "--crate-type", "staticlib")
+        // --locked: build against the committed Cargo.lock exactly, so a release is
+        // reproducible and cannot silently pick up a newer transitive dependency at
+        // build time. Source unchanged does not imply byte-identical machine code;
+        // pinning the lock is one of the inputs that has to be fixed.
+        commandLine("cargo", "rustc", "--release", "--locked", "--target", triple, "--crate-type", "staticlib")
 
         if (triple == "x86_64-pc-windows-gnu") {
             // 需要 mingw-w64 交叉工具链（macOS: brew install mingw-w64）来编译 aws-lc 的 C 代码，
