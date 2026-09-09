@@ -185,3 +185,28 @@ Not tested: 64-core arena GC scalability (hypothesis only). What this run does N
 claim: that "off = zero cost vs pre-change" — the plain path was itself
 restructured; proving byte-equivalence would need a pre-change baseline, not a
 toggle of the same binary.
+
+## JSON string encoding: bulk-append fast path — confirmed win
+
+Sampling /json (perf cpu-clock, clean 2-core box) showed no single dominant
+hotspot, but a JSON-serialization cluster: StringBuilder.ensureCapacity ~0.75% +
+appendJsonString ~0.54%. Cause: `appendJsonString` appended char-by-char, each
+append re-checking capacity, even when nothing needed escaping.
+
+Change (neton `perf/json-string-fastpath`): scan once for the first char needing
+an escape; if none, append the whole string in one bulk copy. Byte-identical
+(fastEnvelopeIsByteIdenticalToKotlinx covers all escape chars + 中文).
+
+Clean-box A/B, two binaries differing ONLY in this path (a temp compile switch),
+pool off, 4 interleaved rounds:
+
+- Tiny `/json` (~58 B, two short strings): after ~37.2k vs before ~36.6k rps —
+  ~1% and inside noise; strings are a small fraction of that response.
+- `/jsonbig` (3786 B, 25 items x 5 string/num fields): before 240/239/240/238 us
+  @ ~6.9k rps; after 201/200/198/199 us @ ~8.2k rps. Every after round beats
+  every before round (no overlap): **-17% per-request CPU (~40 us/req), +18% rps.**
+
+So the win scales with string content — negligible on trivial bodies, decisive on
+the realistic JSON payloads the arena's json profiles use. This is a clean
+sample -> one change -> non-overlapping A/B result, like the method/query-scan
+wins and unlike the context pool.
