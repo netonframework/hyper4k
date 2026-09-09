@@ -127,3 +127,33 @@ cost queues. What this does and does not show:
   not "0 completed in 5s".
 - `json-h2c/4096` stays UNRESOLVED. That the object pool / cheaper serialization
   would fix it is a hypothesis to test on the arena, not a conclusion.
+
+## Context-object pool A/B: no measurable benefit at 2 cores (honest negative)
+
+The request-context pool (neton `feature/request-context-pool`, gated by
+`http.contextPoolSize`) was A/B'd on the clean 2-core Fedora box with ONE binary
+(`examples:bench`, `NETON_CTX_POOL` toggles it), WARN logging, `/json`,
+`wrk -t2 -c128 -d15s`, four interleaved rounds, per-request process CPU from
+/proc/PID/stat:
+
+| | per-req CPU (4 rounds) | rps | RSS |
+|---|---|---|---|
+| pool off (control) | 34.11 / 34.27 / 34.10 / 34.10 µs | 37.4–37.7k | ~21 MB |
+| pool on (2048) | 34.59 / 34.21 / 34.43 / 34.26 µs | 36.8–37.8k | ~21 MB |
+
+CPU, throughput and memory are all within noise; pool-on is if anything a hair
+slower. The three per-request objects it pools (context + view + memory
+response) are simply not a material cost at this scale: K/N reclaims short-lived
+allocations cheaply and the SpinLock + lease-token bookkeeping roughly cancels
+whatever it saves. This matches the sampling story — the real hotspots were
+method parsing and the query map (both already fixed); context allocation never
+showed up.
+
+What this does and does not conclude:
+- On a 2-core box the pool is a wash. Correctness is fully proven
+  (ContextPoolTest + 144-test suite), and it is OFF by default (contextPoolSize=0),
+  so it costs nothing shipped.
+- It does NOT test the 64-core arena, where GC scalability/contention and
+  cross-thread allocation churn differ. That the pool helps there is a HYPOTHESIS,
+  testable only by setting `http.contextPoolSize` on the arena entry and running
+  /benchmark — not a conclusion. On current evidence, do not claim a benefit.
