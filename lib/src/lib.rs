@@ -639,6 +639,50 @@ fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
     deliver_through_channel(responder, delivery)
 }
 
+/// gzip-compress `src` into the caller-provided `dst`.
+///
+/// Returns the compressed length on success. Returns a negative value on
+/// failure; if `dst` was too small, the magnitude is the number of bytes the
+/// output needs, so the caller can retry with a larger buffer. The caller owns
+/// both buffers — nothing is allocated across the boundary. Compression level is
+/// the flate2 default (6), a good ratio/speed balance for JSON responses.
+///
+/// # Safety
+/// `src_ptr`/`dst_ptr` must be valid for `src_len`/`dst_cap` bytes (or null with
+/// the matching length 0).
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_gzip(
+    src_ptr: *const u8,
+    src_len: usize,
+    dst_ptr: *mut u8,
+    dst_cap: usize,
+) -> i64 {
+    use std::io::Write;
+    let src = if src_ptr.is_null() || src_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(src_ptr, src_len)
+    };
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(src.len() / 2 + 64),
+        flate2::Compression::default(),
+    );
+    if enc.write_all(src).is_err() {
+        return -1;
+    }
+    let out = match enc.finish() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    if out.len() > dst_cap {
+        return -(out.len() as i64);
+    }
+    if !dst_ptr.is_null() && !out.is_empty() {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), dst_ptr, out.len());
+    }
+    out.len() as i64
+}
+
 fn deliver_through_channel(responder: u64, delivery: Delivery) -> i32 {
     let sender = pending_responses().remove(&responder);
     i32::from(
@@ -1528,5 +1572,38 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.ends_with("async response"), "{response}");
         unsafe { hyper4k_server_stop(server) };
+    }
+}
+
+#[cfg(test)]
+mod gzip_ffi_tests {
+    use super::hyper4k_gzip;
+    use std::io::Read;
+
+    #[test]
+    fn gzip_roundtrips_and_reports_length() {
+        let src = br#"{"code":0,"message":"OK","data":[{"id":1,"name":"item-name-number-1"}]}"#.repeat(20);
+        let mut dst = vec![0u8; src.len() + src.len() / 2 + 128];
+        let n = unsafe { hyper4k_gzip(src.as_ptr(), src.len(), dst.as_mut_ptr(), dst.len()) };
+        assert!(n > 0, "compression failed: {n}");
+        assert!((n as usize) < src.len(), "should shrink compressible json");
+        let mut d = flate2::read::GzDecoder::new(&dst[..n as usize]);
+        let mut back = Vec::new();
+        d.read_to_end(&mut back).unwrap();
+        assert_eq!(back, src, "gzip must round-trip byte-exact");
+    }
+
+    #[test]
+    fn gzip_reports_needed_size_when_dst_too_small() {
+        let src = b"hello world hello world hello world";
+        let n = unsafe { hyper4k_gzip(src.as_ptr(), src.len(), std::ptr::null_mut(), 0) };
+        assert!(n < 0, "too-small dst must return negative");
+    }
+
+    #[test]
+    fn gzip_empty_input_is_valid() {
+        let mut dst = vec![0u8; 64];
+        let n = unsafe { hyper4k_gzip(std::ptr::null(), 0, dst.as_mut_ptr(), dst.len()) };
+        assert!(n > 0, "empty input still produces a valid gzip stream");
     }
 }

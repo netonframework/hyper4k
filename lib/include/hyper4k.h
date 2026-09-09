@@ -316,6 +316,12 @@ int32_t hyper4k_respond(Hyper4kResponder responder,
                        const uint8_t *headers_ptr, size_t headers_len,
                        const uint8_t *body_ptr, size_t body_len);
 
+/* gzip-compress src into the caller-provided dst. Returns the compressed length,
+ * or a negative value on failure; if dst was too small the magnitude is the size
+ * needed. Both buffers are caller-owned; nothing is allocated across the boundary. */
+int64_t hyper4k_gzip(const uint8_t *src_ptr, size_t src_len,
+                     uint8_t *dst_ptr, size_t dst_cap);
+
 /* -------------------------------------------------------------------------
  * ABI v3: streaming responses
  *

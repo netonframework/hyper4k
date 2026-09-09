@@ -1,6 +1,6 @@
 [package]
 name = "hyper4k"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "High-performance Tokio + Hyper HTTP engine with Kotlin/Native bindings for Neton."
 license = "Apache-2.0"
@@ -21,6 +21,9 @@ hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", 
 http-body-util = "0.1.5"
 bytes = "1.12.1"
 dashmap = "6.2.1"
+# gzip response compression (json-comp). Default backend is miniz_oxide (pure
+# Rust), so it cross-compiles to every target without a C zlib.
+flate2 = "1"
 # Exactly one crypto provider is compiled in. aws-lc-rs is rustls's default and
 # leaves room for FIPS and post-quantum later; its non-FIPS build needs a C
 # compiler but not cmake (verified on all four target platforms).
