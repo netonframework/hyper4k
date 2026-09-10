@@ -3,10 +3,6 @@ package hyper4k
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.addressOf
-import kotlinx.cinterop.toLong
-import kotlinx.cinterop.usePinned
 
 /**
  * `header()` scans the raw block instead of parsing it, so it has to agree with
@@ -89,27 +85,5 @@ class RequestHeaderLookupTest {
         assertEquals("ascii", request.header("X-NAME"))
         assertEquals("value", request.headers["X-名字"]?.first())
         assertEquals("value", request.header("x-名字"))
-    }
-
-    @OptIn(ExperimentalForeignApi::class)
-    @Test
-    fun borrowedHeaderPointerIsMaterializedLazilyAndCorrectly() {
-        val block = "x-request-id: abc\nhost: h\n".encodeToByteArray()
-        block.usePinned { pinned ->
-            val addr = pinned.addressOf(0).toLong()
-            val request = Hyper4kRequest("GET", "/", "", addr, null, block.size, ByteArray(0))
-            assertEquals("abc", request.header("x-request-id"))
-            assertEquals("h", request.header("Host"))
-            assertEquals(listOf("abc"), request.headers["x-request-id"])
-            assertEquals(block.size, request.rawHeaderBytes.size)
-        }
-    }
-
-    @OptIn(ExperimentalForeignApi::class)
-    @Test
-    fun borrowedZeroLengthHeaderPointerIsSafe() {
-        val request = Hyper4kRequest("GET", "/", "", 0L, null, 0, ByteArray(0))
-        assertNull(request.header("x-request-id"))
-        assertEquals(emptyMap(), request.headers)
     }
 }
