@@ -169,6 +169,38 @@ impl Body for Hyper4kBody {
 }
 
 static NEXT_RESPONDER_ID: AtomicU64 = AtomicU64::new(1);
+// Diagnostic counters (HYPER4K_STATS=1): total requests registered vs those that
+// completed synchronously in the callback (the sync fast path). The ratio tells us
+// how often the per-request global registration is wasted.
+static TOTAL_REQS: AtomicU64 = AtomicU64::new(0);
+static SYNC_HITS: AtomicU64 = AtomicU64::new(0);
+static STATS_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn maybe_start_stats() {
+    if std::env::var("HYPER4K_STATS").is_err() {
+        return;
+    }
+    if STATS_STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let (mut pt, mut ps) = (0u64, 0u64);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let t = TOTAL_REQS.load(Ordering::Relaxed);
+            let s = SYNC_HITS.load(Ordering::Relaxed);
+            let (dt, ds) = (t - pt, s - ps);
+            pt = t;
+            ps = s;
+            if dt > 0 {
+                eprintln!(
+                    "[hyper4k.stats] reqs/2s={dt} sync={ds} sync_ratio={:.1}%",
+                    ds as f64 / dt as f64 * 100.0
+                );
+            }
+        }
+    });
+}
 static PENDING_RESPONSES: OnceLock<DashMap<u64, oneshot::Sender<Delivery>>> = OnceLock::new();
 /// Responders that have entered streaming: id -> body sender. Presence in this
 /// map is the single source of truth for the Streaming state.
@@ -238,6 +270,7 @@ impl Drop for PendingResponse {
 
 /// 注册一个异步响应通道。
 fn register_response() -> (u64, oneshot::Receiver<Delivery>, PendingResponse) {
+    TOTAL_REQS.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel::<Delivery>();
     let id = next_responder_id();
     pending_responses().insert(id, tx);
@@ -413,6 +446,7 @@ pub unsafe extern "C" fn hyper4k_server_start(
         Err(_) => return std::ptr::null_mut(),
     };
 
+    maybe_start_stats();
     let ctx = Arc::new(CallbackCtx {
         cb: on_request,
         user_data,
@@ -492,6 +526,7 @@ pub unsafe extern "C" fn hyper4k_server_start_on(
         Err(_) => return std::ptr::null_mut(),
     };
 
+    maybe_start_stats();
     let ctx = Arc::new(CallbackCtx {
         cb: on_request,
         user_data,
@@ -664,6 +699,7 @@ pub unsafe extern "C" fn hyper4k_server_start_tls(
         Err(_) => return std::ptr::null_mut(),
     };
 
+    maybe_start_stats();
     let ctx = Arc::new(CallbackCtx {
         cb: on_request,
         user_data,
@@ -723,6 +759,7 @@ fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
     // 那个请求生效——别的请求即使恰好在这条线程上完成，也必须走通道。
     if IN_CALLBACK.get() == responder {
         if set_sync_response(delivery) {
+            SYNC_HITS.fetch_add(1, Ordering::Relaxed);
             return 1;
         }
         // 槽位被占本不该发生（一个线程同时只在一个回调里）。真发生了也不能丢响应：
