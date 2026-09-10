@@ -205,6 +205,13 @@ static PENDING_RESPONSES: OnceLock<DashMap<u64, oneshot::Sender<Delivery>>> = On
 /// Responders that have entered streaming: id -> body sender. Presence in this
 /// map is the single source of truth for the Streaming state.
 static ACTIVE_STREAMS: OnceLock<DashMap<u64, mpsc::Sender<Bytes>>> = OnceLock::new();
+/// Request header blocks kept alive past handle()'s frame for responders that go
+/// async or stream: the Kotlin handler borrows these bytes (no per-request copy)
+/// and may read them after handle() returns — or even after handle() is cancelled
+/// on a client disconnect — until it delivers the response. Freed when the buffered
+/// response is delivered or the stream finishes. The common sync-buffered request
+/// never enters this map: its header block lives on handle()'s stack.
+static REQUEST_BACKINGS: OnceLock<DashMap<u64, String>> = OnceLock::new();
 
 // ABI v2 同步快路径：回调在 Tokio worker 线程上执行，若 handler 在回调内同步完成，
 // hyper4k_respond 直接把响应写入线程本地槽，省掉 DashMap 注册 + oneshot 交接。
@@ -245,6 +252,10 @@ fn pending_responses() -> &'static DashMap<u64, oneshot::Sender<Delivery>> {
 
 fn active_streams() -> &'static DashMap<u64, mpsc::Sender<Bytes>> {
     ACTIVE_STREAMS.get_or_init(DashMap::new)
+}
+
+fn request_backings() -> &'static DashMap<u64, String> {
+    REQUEST_BACKINGS.get_or_init(DashMap::new)
 }
 
 fn next_responder_id() -> u64 {
@@ -389,15 +400,30 @@ async fn handle(
     IN_CALLBACK.set(0);
 
     let delivery = match take_sync_response() {
-        // Sync path: the _pending guard clears the registry when handle returns.
-        // begin() lands in this same slot when it runs inside the callback.
-        Some(delivery) => delivery,
-        None => match rx.await {
-            Ok(d) => d,
-            Err(_) => {
-                return Ok(error_response(500, b"hyper4k: handler dropped responder"));
+        // Sync completion inside the callback. A buffered response is done — its
+        // header block dies with this frame, and Kotlin already read it inline. A
+        // streaming response keeps running after we return, so its header block must
+        // outlive this frame.
+        Some(delivery) => {
+            if matches!(delivery, Delivery::Stream(_)) {
+                request_backings().insert(responder, header_buf);
             }
-        },
+            delivery
+        }
+        // Async: the handler resumes off-thread and may read the (borrowed) headers
+        // until it delivers. Move the block somewhere that survives even if this
+        // future is cancelled by a client disconnect; it is freed when the buffered
+        // response is delivered (deliver_through_channel) or the stream finishes.
+        None => {
+            request_backings().insert(responder, header_buf);
+            match rx.await {
+                Ok(d) => d,
+                Err(_) => {
+                    request_backings().remove(&responder);
+                    return Ok(error_response(500, b"hyper4k: handler dropped responder"));
+                }
+            }
+        }
     };
 
     Ok(build_response(delivery))
@@ -818,12 +844,17 @@ pub unsafe extern "C" fn hyper4k_gzip(
 }
 
 fn deliver_through_channel(responder: u64, delivery: Delivery) -> i32 {
+    // A buffered delivery ends the request, so free any kept-alive header block. A
+    // stream start keeps running; its backing is freed on finish (or begin failure).
+    let is_stream = matches!(delivery, Delivery::Stream(_));
     let sender = pending_responses().remove(&responder);
-    i32::from(
-        sender
-            .map(|(_, tx)| tx.send(delivery).is_ok())
-            .unwrap_or(false),
-    )
+    let ok = sender
+        .map(|(_, tx)| tx.send(delivery).is_ok())
+        .unwrap_or(false);
+    if !is_stream {
+        request_backings().remove(&responder);
+    }
+    i32::from(ok)
 }
 
 /// Starts a streaming response: status and headers go out now, the body follows
@@ -870,6 +901,7 @@ pub unsafe extern "C" fn hyper4k_response_begin(
 
     if delivered != HYPER4K_OK {
         active_streams().remove(&responder);
+        request_backings().remove(&responder);
         return HYPER4K_ERR_WRONG_STATE;
     }
     HYPER4K_OK
@@ -940,7 +972,10 @@ pub extern "C" fn hyper4k_response_finish(responder: u64) -> i32 {
     }
     // Removing the entry drops the last sender, so the body's recv ends the stream.
     match active_streams().remove(&responder) {
-        Some(_) => HYPER4K_OK,
+        Some(_) => {
+            request_backings().remove(&responder);
+            HYPER4K_OK
+        }
         None => HYPER4K_ERR_WRONG_STATE,
     }
 }
@@ -1026,7 +1061,8 @@ mod tests {
     use super::{
         active_streams, hyper4k_respond, hyper4k_response_begin, hyper4k_response_finish,
         hyper4k_response_write, hyper4k_server_start, hyper4k_server_stop, parse_headers,
-        register_response, take_sync_response, Delivery, Hyper4kRequest, ResponseData,
+        deliver_through_channel, register_response, request_backings, take_sync_response, Delivery,
+        Hyper4kRequest, ResponseData, StreamStart,
         HYPER4K_ERR_CLIENT_GONE, HYPER4K_ERR_WRONG_STATE, HYPER4K_OK, IN_CALLBACK,
     };
     use std::ffi::{c_void, CString};
@@ -1036,6 +1072,54 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
+
+    fn buffered_delivery(status: u16) -> Delivery {
+        Delivery::Buffered(ResponseData {
+            status,
+            headers: hyper::HeaderMap::new(),
+            body: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn backing_is_freed_on_buffered_delivery_and_kept_for_streams() {
+        // Async buffered: a kept-alive header block is dropped once delivered.
+        let (id, mut rx, _pending) = register_response();
+        request_backings().insert(id, "host: h\n".to_owned());
+        assert!(request_backings().contains_key(&id));
+        assert_eq!(deliver_through_channel(id, buffered_delivery(200)), 1);
+        assert!(
+            !request_backings().contains_key(&id),
+            "buffered delivery must free backing"
+        );
+        let _ = rx.try_recv();
+
+        // Stream start keeps the backing until finish() ends the stream.
+        let (sid, _srx, _sp) = register_response();
+        request_backings().insert(sid, "host: h\n".to_owned());
+        let (tx, srx2) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        active_streams().insert(sid, tx);
+        assert_eq!(
+            deliver_through_channel(
+                sid,
+                Delivery::Stream(StreamStart {
+                    status: 200,
+                    headers: hyper::HeaderMap::new(),
+                    rx: srx2,
+                })
+            ),
+            1
+        );
+        assert!(
+            request_backings().contains_key(&sid),
+            "stream start must keep backing"
+        );
+        assert_eq!(hyper4k_response_finish(sid), HYPER4K_OK);
+        assert!(
+            !request_backings().contains_key(&sid),
+            "finish must free backing"
+        );
+    }
 
     /// Unwraps a one-shot delivery; a stream is a failure in these cases.
     fn buffered(delivery: Delivery) -> ResponseData {

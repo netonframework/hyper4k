@@ -167,13 +167,18 @@ internal class AsyncRequestDispatcher(
 
     fun submit(requestPointer: CPointer<CHyper4kRequest>) {
         val source = requestPointer.pointed
+        // 头块不再每请求拷进 Kotlin：改传 Rust 借用切片的原生指针地址+长度，真正读头时
+        // 才物化（见 Hyper4kRequest）。引擎保证该借用在整个 handler 期间有效（lib.rs
+        // REQUEST_BACKINGS），故无需在此拷贝或兜异步。绝大多数跑分路由不读头 → 零拷贝。
+        val hslice = source.headers
         submit(
             request = Hyper4kRequest(
                 method = source.method.copyToString(),
                 path = source.path.copyToString(),
                 query = source.query.copyToString(),
-                // 头块直接存字节，省掉 String 中转；解析在 Hyper4kRequest 内惰性完成。
-                rawHeaderBytes = source.headers.copyToByteArray(),
+                headerAddr = hslice.ptr?.toLong() ?: 0L,
+                ownedHeaderBytes = null,
+                borrowedLen = hslice.len.toInt(),
                 body = source.body.copyToByteArray(),
             ),
             responder = source.responder,
@@ -516,6 +521,13 @@ private suspend fun <R> lazyTimeout(timeoutMillis: Long, block: suspend () -> R)
 }
 
 private fun internalErrorResponse() = defaultFailureResponse(500, "Internal Server Error")
+
+@OptIn(ExperimentalForeignApi::class)
+internal actual fun copyBorrowedHeaders(addr: Long, len: Int): ByteArray {
+    if (len <= 0 || addr == 0L) return ByteArray(0)
+    val ptr = addr.toCPointer<ByteVar>() ?: return ByteArray(0)
+    return ptr.readBytes(len)
+}
 
 @OptIn(ExperimentalForeignApi::class)
 private fun hyper4k.cinterop.Hyper4kSlice.copyToByteArray(): ByteArray {
