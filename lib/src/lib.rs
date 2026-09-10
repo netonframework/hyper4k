@@ -277,9 +277,28 @@ fn build_response(delivery: Delivery) -> Response<Hyper4kBody> {
 }
 
 pub struct Hyper4kServer {
-    // drop 时关闭 runtime
-    _runtime: Runtime,
+    // Keeps the runtime alive for this listener's lifetime. `Owned` created its
+    // own runtime (legacy per-listener path); `Shared` borrows an application
+    // runtime via an Arc so several listeners share one worker pool. Dropping the
+    // server only releases its hold — the shared runtime shuts down when its owner
+    // (the app) and every borrowing listener are gone.
+    _runtime: RuntimeHold,
     shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+// The payloads are never read; they are held so their Drop keeps the runtime
+// alive for the listener's lifetime (RAII), then releases/joins it on drop.
+#[allow(dead_code)]
+enum RuntimeHold {
+    Owned(Runtime),
+    Shared(Arc<Runtime>),
+}
+
+/// An application-owned Tokio runtime that listeners borrow. Created explicitly by
+/// the app (not a hidden global singleton), so two independent apps/tests in one
+/// process each get their own — no forced shared global state.
+pub struct Hyper4kRuntime {
+    rt: Arc<Runtime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +422,85 @@ pub unsafe extern "C" fn hyper4k_server_start(
     runtime.spawn(serve_plaintext(listener, ctx, shutdown_rx));
 
     Box::into_raw(Box::new(Hyper4kServer {
-        _runtime: runtime,
+        _runtime: RuntimeHold::Owned(runtime),
+        shutdown_tx: Some(shutdown_tx),
+    }))
+}
+
+/// Create an application runtime that listeners can share. `worker_threads == 0`
+/// uses Tokio's default (available parallelism); a positive value pins the worker
+/// count (deployment/diagnostic override). Returns null if the runtime cannot be
+/// built. The caller owns the handle and must call [`hyper4k_runtime_shutdown`]
+/// after every listener started on it has stopped.
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_runtime_new(worker_threads: u32) -> *mut Hyper4kRuntime {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if worker_threads > 0 {
+        builder.worker_threads(worker_threads as usize);
+    }
+    match builder.build() {
+        Ok(rt) => Box::into_raw(Box::new(Hyper4kRuntime { rt: Arc::new(rt) })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Release the application's hold on the runtime. The runtime is dropped (and its
+/// worker threads joined) once this owner hold and every borrowing listener are
+/// gone, so call it only after the listeners are stopped. Dropping it while a
+/// listener still holds its Arc just decrements the count — the last holder frees
+/// it — so a mis-ordered shutdown cannot leave a listener running on a freed
+/// runtime, nor abort in-flight work on other listeners.
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_runtime_shutdown(handle: *mut Hyper4kRuntime) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle));
+}
+
+/// Like [`hyper4k_server_start`] but binds the listener on a shared application
+/// runtime instead of creating its own. The listener keeps its own shutdown
+/// channel, so stopping it cancels only its accept loop; the shared runtime and
+/// the other listeners are untouched. A bind failure returns null without
+/// affecting the runtime (local recovery). `runtime` must be a live handle from
+/// [`hyper4k_runtime_new`].
+#[no_mangle]
+pub unsafe extern "C" fn hyper4k_server_start_on(
+    runtime: *mut Hyper4kRuntime,
+    host: *const c_char,
+    port: u16,
+    on_request: Hyper4kRequestCallback,
+    user_data: *mut c_void,
+) -> *mut Hyper4kServer {
+    if runtime.is_null() {
+        return std::ptr::null_mut();
+    }
+    let shared = (*runtime).rt.clone();
+
+    let host = if host.is_null() {
+        "0.0.0.0".to_owned()
+    } else {
+        CStr::from_ptr(host).to_str().unwrap_or("0.0.0.0").to_owned()
+    };
+    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let listener = match shared.block_on(async { TcpListener::bind(addr).await }) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let ctx = Arc::new(CallbackCtx {
+        cb: on_request,
+        user_data,
+    });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    shared.spawn(serve_plaintext(listener, ctx, shutdown_rx));
+
+    Box::into_raw(Box::new(Hyper4kServer {
+        _runtime: RuntimeHold::Shared(shared),
         shutdown_tx: Some(shutdown_tx),
     }))
 }
@@ -576,7 +673,7 @@ pub unsafe extern "C" fn hyper4k_server_start_tls(
     runtime.spawn(serve_tls(listener, acceptor, ctx, shutdown_rx));
 
     Box::into_raw(Box::new(Hyper4kServer {
-        _runtime: runtime,
+        _runtime: RuntimeHold::Owned(runtime),
         shutdown_tx: Some(shutdown_tx),
     }))
 }

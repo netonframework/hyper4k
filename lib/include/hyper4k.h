@@ -259,6 +259,27 @@ uint32_t hyper4k_client_paused_stream_count(Hyper4kClient *client);
 typedef struct Hyper4kServer Hyper4kServer;
 typedef uint64_t Hyper4kResponder;
 
+/* Application-owned runtime that multiple listeners can share. */
+typedef struct Hyper4kRuntime Hyper4kRuntime;
+
+/* Create a shared runtime. worker_threads==0 uses Tokio's default (available
+ * parallelism); a positive value pins the worker count. NULL on failure. The
+ * caller owns it and must call hyper4k_runtime_shutdown after its listeners stop. */
+Hyper4kRuntime *hyper4k_runtime_new(uint32_t worker_threads);
+
+/* Release the app's hold on the runtime; it is dropped once this owner and every
+ * borrowing listener are gone. Safe to call after listeners are stopped. */
+void hyper4k_runtime_shutdown(Hyper4kRuntime *runtime);
+
+/* Like hyper4k_server_start but binds on a shared runtime. Stopping the returned
+ * server cancels only its own accept loop; the runtime and other listeners are
+ * untouched. Bind failure returns NULL without affecting the runtime. */
+Hyper4kServer *hyper4k_server_start_on(Hyper4kRuntime *runtime,
+                                       const char *host,
+                                       uint16_t port,
+                                       Hyper4kRequestCallback on_request,
+                                       void *user_data);
+
 
 /*
  * 单次请求视图。所有切片在 on_request 调用期间有效，
