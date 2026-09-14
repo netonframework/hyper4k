@@ -13,6 +13,8 @@ class Hyper4kRequest(
     /** 原始头块字节，"Name: Value\n" 串联。惰性解析见 [headers]。 */
     val rawHeaderBytes: ByteArray,
     val body: ByteArray,
+    /** 传输层看到的 TCP 对端，格式通常为 IP:port；不受代理请求头影响。 */
+    val peerAddress: String = "",
 ) {
     /** 兼容旧构造：文本头块会自动转成字节存储。 */
     constructor(
@@ -21,7 +23,8 @@ class Hyper4kRequest(
         query: String,
         rawHeaders: String,
         body: ByteArray,
-    ) : this(method, path, query, rawHeaders.encodeToByteArray(), body)
+        peerAddress: String = "",
+    ) : this(method, path, query, rawHeaders.encodeToByteArray(), body, peerAddress)
 
     /** 原始头块文本（从字节惰性解码）。 */
     val rawHeaders: String by lazy(LazyThreadSafetyMode.NONE) { rawHeaderBytes.decodeToString() }

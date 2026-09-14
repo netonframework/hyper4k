@@ -79,6 +79,8 @@ pub struct Hyper4kRequest {
     pub headers: Hyper4kSlice,
     pub body: Hyper4kSlice,
     pub responder: u64,
+    /// TCP peer captured by accept(), formatted as IP:port.
+    pub peer_address: Hyper4kSlice,
 }
 
 pub type Hyper4kRequestCallback = extern "C" fn(user_data: *mut c_void, req: *const Hyper4kRequest);
@@ -341,6 +343,7 @@ pub struct Hyper4kRuntime {
 async fn handle(
     req: Request<Incoming>,
     ctx: Arc<CallbackCtx>,
+    peer_address: Arc<str>,
 ) -> Result<Response<Hyper4kBody>, Infallible> {
     // Move the parsed method/URI instead of allocating strings for Kotlin to
     // copy again. Release the original headers/extensions before reading body.
@@ -380,6 +383,7 @@ async fn handle(
             headers: Hyper4kSlice::borrow(header_buf.as_bytes()),
             body: Hyper4kSlice::borrow(&body),
             responder,
+            peer_address: Hyper4kSlice::borrow(peer_address.as_bytes()),
         };
 
         // 调进 Kotlin。同步完成的 handler 会在回调内直接调 hyper4k_respond，
@@ -553,13 +557,14 @@ async fn serve_plaintext(
         tokio::select! {
             _ = &mut shutdown => break,
             accept = listener.accept() => {
-                let (stream, _peer) = match accept {
+                let (stream, peer) = match accept {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 let ctx = ctx.clone();
+                let peer_address: Arc<str> = Arc::from(peer.to_string());
                 tokio::spawn(async move {
-                    let service = service_fn(move |req| handle(req, ctx.clone()));
+                    let service = service_fn(move |req| handle(req, ctx.clone(), peer_address.clone()));
                     let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -584,19 +589,20 @@ async fn serve_tls(
         tokio::select! {
             _ = &mut shutdown => break,
             accept = listener.accept() => {
-                let (stream, _peer) = match accept {
+                let (stream, peer) = match accept {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 let ctx = ctx.clone();
                 let acceptor = acceptor.clone();
+                let peer_address: Arc<str> = Arc::from(peer.to_string());
                 tokio::spawn(async move {
                     let tls = match acceptor.accept(stream).await {
                         Ok(t) => t,
                         // A failed handshake is the peer's business, not an error here.
                         Err(_) => return,
                     };
-                    let service = service_fn(move |req| handle(req, ctx.clone()));
+                    let service = service_fn(move |req| handle(req, ctx.clone(), peer_address.clone()));
                     // ALPN already chose the protocol during the handshake, so the
                     // builder is told which one rather than sniffing for it.
                     let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())

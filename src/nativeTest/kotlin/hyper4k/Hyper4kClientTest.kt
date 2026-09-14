@@ -70,6 +70,21 @@ class Hyper4kClientTest {
     }
 
     @Test
+    fun reportsTheTransportPeerAddress() = withServer({ request, _ ->
+        Hyper4kResponse.text(body = request.peerAddress)
+    }) { port ->
+        val client = Hyper4kClient()
+        try {
+            val stream = client.send(Hyper4kClientRequest("GET", "http://127.0.0.1:$port/peer"))
+            val (_, body, done) = stream.drain()
+            assertNull(done.error)
+            assertTrue(body.decodeToString().startsWith("127.0.0.1:"), body.decodeToString())
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
     fun backpressurePausesTheEngineWhenTheConsumerLags() = withServer({ _, channel ->
         channel.begin(200)
         repeat(64) { channel.write(ByteArray(1024) { it.toByte() }) }

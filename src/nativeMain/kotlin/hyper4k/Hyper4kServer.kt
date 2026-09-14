@@ -175,6 +175,7 @@ internal class AsyncRequestDispatcher(
                 // 头块直接存字节，省掉 String 中转；解析在 Hyper4kRequest 内惰性完成。
                 rawHeaderBytes = source.headers.copyToByteArray(),
                 body = source.body.copyToByteArray(),
+                peerAddress = source.peer_address.copyToString(),
             ),
             responder = source.responder,
         )

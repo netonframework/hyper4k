@@ -275,6 +275,7 @@ typedef struct Hyper4kRequest {
     Hyper4kSlice headers;   /* "Name: Value\n" 串联             */
     Hyper4kSlice body;      /* 已聚合的请求体（v1 非流式）      */
     Hyper4kResponder responder;
+    Hyper4kSlice peer_address; /* TCP 对端，格式为 IP:port          */
 } Hyper4kRequest;
 
 /* 每请求回调。user_data 即 start 时传入的指针。 */
