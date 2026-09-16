@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "hyper4k"
-version = "0.8.0"
+version = "0.9.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -381,6 +381,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
@@ -822,6 +823,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

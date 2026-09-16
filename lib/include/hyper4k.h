@@ -399,7 +399,11 @@ int32_t hyper4k_response_write(Hyper4kResponder responder,
  */
 int32_t hyper4k_response_finish(Hyper4kResponder responder);
 
-/* 优雅停止并释放服务器句柄。停止后 server 指针失效。 */
+/* Stop admission, cancel and join this listener's connection tasks, then release
+ * the server handle. Drain application work before calling. On return no request
+ * callback from this listener is executing; user_data may then be released.
+ * Must not be called from a Tokio runtime or request callback (it blocks).
+ * Sibling listeners on a shared runtime are unaffected. Pointer invalid on return. */
 void hyper4k_server_stop(Hyper4kServer *server);
 
 #ifdef __cplusplus

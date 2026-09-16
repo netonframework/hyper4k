@@ -169,7 +169,7 @@ internal class AsyncRequestDispatcher(
         val source = requestPointer.pointed
         submit(
             request = Hyper4kRequest(
-                method = source.method.copyToString(),
+                method = source.method.copyHttpMethod(),
                 path = source.path.copyToString(),
                 query = source.query.copyToString(),
                 // 头块直接存字节，省掉 String 中转；解析在 Hyper4kRequest 内惰性完成。
@@ -528,3 +528,27 @@ private fun hyper4k.cinterop.Hyper4kSlice.copyToByteArray(): ByteArray {
 
 @OptIn(ExperimentalForeignApi::class)
 private fun hyper4k.cinterop.Hyper4kSlice.copyToString(): String = copyToByteArray().decodeToString()
+
+// Standard methods are immutable process-wide strings. Match the borrowed bytes
+// in the callback, without allocating a temporary ByteArray and decoded String.
+// Extension methods retain the copying path and their original case.
+@OptIn(ExperimentalForeignApi::class)
+internal fun hyper4k.cinterop.Hyper4kSlice.copyHttpMethod(): String {
+    when (len.toInt()) {
+        3 -> if (matchesAscii("GET")) return "GET" else if (matchesAscii("PUT")) return "PUT"
+        4 -> if (matchesAscii("POST")) return "POST" else if (matchesAscii("HEAD")) return "HEAD"
+        5 -> if (matchesAscii("PATCH")) return "PATCH" else if (matchesAscii("TRACE")) return "TRACE"
+        6 -> if (matchesAscii("DELETE")) return "DELETE"
+        7 -> if (matchesAscii("OPTIONS")) return "OPTIONS" else if (matchesAscii("CONNECT")) return "CONNECT"
+    }
+    return copyToString()
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun hyper4k.cinterop.Hyper4kSlice.matchesAscii(value: String): Boolean {
+    val bytes = ptr ?: return false
+    for (index in value.indices) {
+        if (bytes[index].toInt() != value[index].code) return false
+    }
+    return true
+}

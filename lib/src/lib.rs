@@ -24,7 +24,9 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+#[cfg(test)]
+use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot};
@@ -179,7 +181,7 @@ static SYNC_HITS: AtomicU64 = AtomicU64::new(0);
 static STATS_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn maybe_start_stats() {
-    if std::env::var("HYPER4K_STATS").is_err() {
+    if std::env::var("HYPER4K_STATS").as_deref() != Ok("1") {
         return;
     }
     if STATS_STARTED.swap(true, Ordering::Relaxed) {
@@ -202,6 +204,14 @@ fn maybe_start_stats() {
             }
         }
     });
+}
+
+#[inline]
+fn count_if_enabled(counter: &AtomicU64, enabled: &std::sync::atomic::AtomicBool) {
+    // Disabled diagnostics must not contend on a process-wide counter.
+    if enabled.load(Ordering::Relaxed) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 static PENDING_RESPONSES: OnceLock<DashMap<u64, oneshot::Sender<Delivery>>> = OnceLock::new();
 /// Responders that have entered streaming: id -> body sender. Presence in this
@@ -272,7 +282,7 @@ impl Drop for PendingResponse {
 
 /// 注册一个异步响应通道。
 fn register_response() -> (u64, oneshot::Receiver<Delivery>, PendingResponse) {
-    TOTAL_REQS.fetch_add(1, Ordering::Relaxed);
+    count_if_enabled(&TOTAL_REQS, &STATS_STARTED);
     let (tx, rx) = oneshot::channel::<Delivery>();
     let id = next_responder_id();
     pending_responses().insert(id, tx);
@@ -311,6 +321,8 @@ fn build_response(delivery: Delivery) -> Response<Hyper4kBody> {
         .unwrap_or_else(|_| error_response(500, b"hyper4k: bad response"))
 }
 
+mod listener_executor;
+
 pub struct Hyper4kServer {
     // Keeps the runtime alive for this listener's lifetime. `Owned` created its
     // own runtime (legacy per-listener path); `Shared` borrows an application
@@ -319,11 +331,10 @@ pub struct Hyper4kServer {
     // (the app) and every borrowing listener are gone.
     _runtime: RuntimeHold,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    listener_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-// The payloads are never read; they are held so their Drop keeps the runtime
-// alive for the listener's lifetime (RAII), then releases/joins it on drop.
-#[allow(dead_code)]
+// Keep the runtime alive while the listener joins its connection tasks.
 enum RuntimeHold {
     Owned(Runtime),
     Shared(Arc<Runtime>),
@@ -457,16 +468,17 @@ pub unsafe extern "C" fn hyper4k_server_start(
     });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    runtime.spawn(serve_plaintext(listener, ctx, shutdown_rx));
+    let listener_task = runtime.spawn(serve_plaintext(listener, ctx, shutdown_rx));
 
     Box::into_raw(Box::new(Hyper4kServer {
         _runtime: RuntimeHold::Owned(runtime),
         shutdown_tx: Some(shutdown_tx),
+        listener_task: Some(listener_task),
     }))
 }
 
 /// Create an application runtime that listeners can share. `worker_threads == 0`
-/// uses Tokio's default (available parallelism); a positive value pins the worker
+/// uses Tokio's default (available parallelism); a positive value sets the worker
 /// count (deployment/diagnostic override). Returns null if the runtime cannot be
 /// built. The caller owns the handle and must call [`hyper4k_runtime_shutdown`]
 /// after every listener started on it has stopped.
@@ -499,8 +511,8 @@ pub unsafe extern "C" fn hyper4k_runtime_shutdown(handle: *mut Hyper4kRuntime) {
 
 /// Like [`hyper4k_server_start`] but binds the listener on a shared application
 /// runtime instead of creating its own. The listener keeps its own shutdown
-/// channel, so stopping it cancels only its accept loop; the shared runtime and
-/// the other listeners are untouched. A bind failure returns null without
+/// channel, so stopping it cancels and joins only its own connections and stream
+/// tasks; the shared runtime and other listeners are untouched. A bind failure returns null without
 /// affecting the runtime (local recovery). `runtime` must be a live handle from
 /// [`hyper4k_runtime_new`].
 #[no_mangle]
@@ -536,11 +548,12 @@ pub unsafe extern "C" fn hyper4k_server_start_on(
         user_data,
     });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    shared.spawn(serve_plaintext(listener, ctx, shutdown_rx));
+    let listener_task = shared.spawn(serve_plaintext(listener, ctx, shutdown_rx));
 
     Box::into_raw(Box::new(Hyper4kServer {
         _runtime: RuntimeHold::Shared(shared),
         shutdown_tx: Some(shutdown_tx),
+        listener_task: Some(listener_task),
     }))
 }
 
@@ -553,25 +566,32 @@ async fn serve_plaintext(
     ctx: Arc<CallbackCtx>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
+    let executor = listener_executor::ListenerExecutor::new();
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            _ = connections.join_next(), if !connections.is_empty() => {},
             accept = listener.accept() => {
                 let (stream, peer) = match accept {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 let ctx = ctx.clone();
+                let executor = executor.clone();
                 let peer_address: Arc<str> = Arc::from(peer.to_string());
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let service = service_fn(move |req| handle(req, ctx.clone(), peer_address.clone()));
-                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    let _ = hyper_util::server::conn::auto::Builder::new(executor)
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
                 });
             }
         }
     }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    executor.stop().await;
 }
 
 /// Serves a TLS listener until `shutdown` fires.
@@ -585,18 +605,22 @@ async fn serve_tls(
     ctx: Arc<CallbackCtx>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
+    let executor = listener_executor::ListenerExecutor::new();
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            _ = connections.join_next(), if !connections.is_empty() => {},
             accept = listener.accept() => {
                 let (stream, peer) = match accept {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 let ctx = ctx.clone();
+                let executor = executor.clone();
                 let acceptor = acceptor.clone();
                 let peer_address: Arc<str> = Arc::from(peer.to_string());
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let tls = match acceptor.accept(stream).await {
                         Ok(t) => t,
                         // A failed handshake is the peer's business, not an error here.
@@ -605,13 +629,16 @@ async fn serve_tls(
                     let service = service_fn(move |req| handle(req, ctx.clone(), peer_address.clone()));
                     // ALPN already chose the protocol during the handshake, so the
                     // builder is told which one rather than sniffing for it.
-                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    let _ = hyper_util::server::conn::auto::Builder::new(executor)
                         .serve_connection(TokioIo::new(tls), service)
                         .await;
                 });
             }
         }
     }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    executor.stop().await;
 }
 
 /// Builds a rustls server config from PEM files on disk.
@@ -712,11 +739,12 @@ pub unsafe extern "C" fn hyper4k_server_start_tls(
     });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-    runtime.spawn(serve_tls(listener, acceptor, ctx, shutdown_rx));
+    let listener_task = runtime.spawn(serve_tls(listener, acceptor, ctx, shutdown_rx));
 
     Box::into_raw(Box::new(Hyper4kServer {
         _runtime: RuntimeHold::Owned(runtime),
         shutdown_tx: Some(shutdown_tx),
+        listener_task: Some(listener_task),
     }))
 }
 
@@ -765,7 +793,7 @@ fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
     // 那个请求生效——别的请求即使恰好在这条线程上完成，也必须走通道。
     if IN_CALLBACK.get() == responder {
         if set_sync_response(delivery) {
-            SYNC_HITS.fetch_add(1, Ordering::Relaxed);
+            count_if_enabled(&SYNC_HITS, &STATS_STARTED);
             return 1;
         }
         // 槽位被占本不该发生（一个线程同时只在一个回调里）。真发生了也不能丢响应：
@@ -955,6 +983,9 @@ pub extern "C" fn hyper4k_response_finish(responder: u64) -> i32 {
 ///
 /// # Safety
 /// `server` 必须是 `hyper4k_server_start` 返回且未被 stop 过的指针。
+/// Call from outside a Tokio runtime and never from a request callback. This
+/// blocks until this listener's connections finish cancellation, so user_data
+/// can be released after it returns. Application handlers should drain first.
 #[no_mangle]
 pub unsafe extern "C" fn hyper4k_server_stop(server: *mut Hyper4kServer) {
     if server.is_null() {
@@ -964,7 +995,12 @@ pub unsafe extern "C" fn hyper4k_server_stop(server: *mut Hyper4kServer) {
     if let Some(tx) = s.shutdown_tx.take() {
         let _ = tx.send(());
     }
-    // drop(s) -> drop(runtime) 关闭所有 worker。
+    if let Some(task) = s.listener_task.take() {
+        match &s._runtime {
+            RuntimeHold::Owned(runtime) => { let _ = runtime.block_on(task); }
+            RuntimeHold::Shared(runtime) => { let _ = runtime.block_on(task); }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1064,12 @@ mod server_tls_tests;
 mod h2_flow_tests;
 
 #[cfg(test)]
+mod pipeline_tests;
+
+#[cfg(test)]
+mod shared_runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         active_streams, hyper4k_respond, hyper4k_response_begin, hyper4k_response_finish,
@@ -1042,6 +1084,38 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn disabled_diagnostics_leave_the_counter_untouched() {
+        let enabled = std::sync::atomic::AtomicBool::new(false);
+        let counter = std::sync::atomic::AtomicU64::new(17);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10_000 {
+                        super::count_if_enabled(&counter, &enabled);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 17);
+    }
+
+    #[test]
+    fn enabled_diagnostics_count_concurrent_events() {
+        let enabled = std::sync::atomic::AtomicBool::new(true);
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10_000 {
+                        super::count_if_enabled(&counter, &enabled);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 80_000);
+    }
 
     /// Unwraps a one-shot delivery; a stream is a failure in these cases.
     fn buffered(delivery: Delivery) -> ResponseData {

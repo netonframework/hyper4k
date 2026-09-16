@@ -1,6 +1,6 @@
 [package]
 name = "hyper4k"
-version = "0.8.0"
+version = "0.9.2"
 edition = "2021"
 description = "High-performance Tokio + Hyper HTTP engine with Kotlin/Native bindings for Neton."
 license = "Apache-2.0"
@@ -16,6 +16,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
 hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.5"

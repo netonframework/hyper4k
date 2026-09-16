@@ -439,6 +439,8 @@ fn a_committed_response_that_truncates_reports_truncated_not_unknown() {
     // Headers arrive, then the peer vanishes. The request certainly ran, so the
     // caller must be able to tell this apart from "we do not know".
     let r = rt();
+    let close_after_headers = Arc::new(tokio::sync::Notify::new());
+    let close_gate = close_after_headers.clone();
     let peer = r.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -452,11 +454,14 @@ fn a_committed_response_that_truncates_reports_truncated_not_unknown() {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
-                // Promise 100 bytes, send 3, then disappear.
+                // Promise 100 bytes, send 3, then wait until headers have been
+                // delivered. Otherwise DiscardThenDone may legally discard the
+                // queued headers, and the assertion below races the bridge.
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
                     .await;
                 let _ = sock.flush().await;
+                close_gate.notified().await;
                 drop(sock);
             }
         });
@@ -470,6 +475,10 @@ fn a_committed_response_that_truncates_reports_truncated_not_unknown() {
     });
     let url = format!("http://{}/x", peer.addr);
     assert_eq!(send_method(client, "GET", &url, &cap), HYPER4K_STATUS_OK);
+    wait_until("headers delivered before disconnect", || {
+        cap.headers_calls.load(Ordering::SeqCst) == 1
+    });
+    close_after_headers.notify_one();
     wait_until("done", || cap.done.lock().unwrap().is_some());
 
     assert_eq!(*cap.done.lock().unwrap(), Some(HYPER4K_ERR_TRUNCATED));
