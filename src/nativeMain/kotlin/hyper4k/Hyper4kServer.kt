@@ -38,9 +38,9 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 /**
  * Tokio + Hyper server with a suspend-native Kotlin/Native handoff.
  *
- * The Rust callback only snapshots request bytes and schedules work. Application handlers never
- * execute on Tokio workers. Concurrency is bounded so overload is rejected instead of building an
- * unbounded coroutine or memory backlog.
+ * Handlers start inline on the engine worker and switch to the coroutine dispatcher if they
+ * suspend. They must not perform blocking work on that inline path. Concurrency is bounded so
+ * overload is rejected instead of building an unbounded coroutine or memory backlog.
  */
 @OptIn(ExperimentalForeignApi::class, ExperimentalAtomicApi::class)
 class Hyper4kServer(
@@ -70,7 +70,7 @@ class Hyper4kServer(
 
     val isRunning: Boolean get() = server != null
 
-    /** Starts the listener. Request handlers are always dispatched asynchronously. */
+    /** Starts the listener. Non-suspending handlers may complete inline. */
     fun start(handler: Hyper4kHandler) {
         start { request, _ -> handler(request) }
     }
@@ -197,26 +197,28 @@ internal class AsyncRequestDispatcher(
             return
         }
 
-        // UNDISPATCHED: handlers that never suspend run inline on the engine worker,
-        // skipping the cross-thread hop to Dispatchers.Default; suspending handlers
-        // still resume on Default as before.
+        // Disabling the deadline must not disable shutdown cancellation.
         scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            val channel = newChannel(responder)
-            val response = try {
-                if (requestTimeoutMillis > 0) {
-                    lazyTimeout(requestTimeoutMillis) { handler(request, channel) }
-                } else {
-                    handler(request, channel)
-                }
-            } catch (_: TimeoutCancellationException) {
-                failureResponse(504, "Gateway Timeout")
-            } catch (_: CancellationException) {
-                failureResponse(503, "Service Unavailable")
-            } catch (_: Throwable) {
-                failureResponse(500, "Internal Server Error")
-            }
-            finish(responder, response, channel)
+            runRequest(request, responder)
         }
+    }
+
+    private suspend fun runRequest(request: Hyper4kRequest, responder: ULong) {
+        val channel = newChannel(responder)
+        val response = try {
+            if (requestTimeoutMillis > 0) {
+                lazyTimeout(requestTimeoutMillis) { handler(request, channel) }
+            } else {
+                handler(request, channel)
+            }
+        } catch (_: TimeoutCancellationException) {
+            failureResponse(504, "Gateway Timeout")
+        } catch (_: CancellationException) {
+            failureResponse(503, "Service Unavailable")
+        } catch (_: Throwable) {
+            failureResponse(500, "Internal Server Error")
+        }
+        finish(responder, response, channel)
     }
 
     fun stopAccepting() {
@@ -432,6 +434,12 @@ internal class NativeResponseChannel(private val responder: ULong) : Hyper4kResp
  */
 private fun encodeHeaders(headers: Map<String, List<String>>): ByteArray {
     if (headers.isEmpty()) return ByteArray(0)
+    if (headers.size == 1) {
+        val values = headers["Content-Type"]
+        if (values != null && values.size == 1) {
+            CommonContentTypeBytes.get(values[0])?.let { return it }
+        }
+    }
 
     // Straight into bytes when everything is ASCII, which is what header names
     // and values are in practice. Building a String first and encoding it
@@ -491,6 +499,24 @@ private fun String.isAscii(): Boolean {
     return true
 }
 
+/** Fixed transport bytes only: never retain application headers or response bodies. */
+private object CommonContentTypeBytes {
+    private val plain = "Content-Type: text/plain; charset=utf-8".encodeToByteArray()
+    private val json = "Content-Type: application/json".encodeToByteArray()
+    private val jsonUtf8 = "Content-Type: application/json; charset=utf-8".encodeToByteArray()
+    private val html = "Content-Type: text/html; charset=utf-8".encodeToByteArray()
+
+    // Private arrays are read-only throughout respond()/begin(); Rust copies them
+    // before returning from the FFI call. Concurrent readers do not share mutable state.
+    fun get(value: String): ByteArray? = when (value) {
+        "text/plain; charset=utf-8" -> plain
+        "application/json" -> json
+        "application/json; charset=utf-8" -> jsonUtf8
+        "text/html; charset=utf-8" -> html
+        else -> null
+    }
+}
+
 /** Test seam: [encodeHeaders] is file-private and has no other caller in the module. */
 internal fun encodeHeadersForTest(headers: Map<String, List<String>>): ByteArray = encodeHeaders(headers)
 
@@ -527,7 +553,8 @@ private fun hyper4k.cinterop.Hyper4kSlice.copyToByteArray(): ByteArray {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun hyper4k.cinterop.Hyper4kSlice.copyToString(): String = copyToByteArray().decodeToString()
+private fun hyper4k.cinterop.Hyper4kSlice.copyToString(): String =
+    if (requestStringScratchEnabled) copyRequestString() else copyToByteArray().decodeToString()
 
 // Standard methods are immutable process-wide strings. Match the borrowed bytes
 // in the callback, without allocating a temporary ByteArray and decoded String.

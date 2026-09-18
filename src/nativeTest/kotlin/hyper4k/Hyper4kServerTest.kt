@@ -11,6 +11,33 @@ import kotlin.test.assertTrue
 
 class Hyper4kServerTest {
     @Test
+    fun shutdownCancelsSuspendedRequestsWithoutADeadline() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val cleaned = CompletableDeferred<Unit>()
+        val response = CompletableDeferred<Hyper4kResponse>()
+        val dispatcher = AsyncRequestDispatcher(
+            handler = { _, _ ->
+                try {
+                    gate.await()
+                    Hyper4kResponse.text(body = "unexpected")
+                } finally {
+                    cleaned.complete(Unit)
+                }
+            },
+            maxConcurrentRequests = 1,
+            requestTimeoutMillis = 0,
+            complete = { _, value -> response.complete(value) },
+        )
+        dispatcher.submit(request(), 1uL)
+        dispatcher.stopAccepting()
+        dispatcher.cancelAndJoin()
+        withTimeout(1_000) {
+            cleaned.await()
+            assertEquals(503, response.await().status)
+        }
+    }
+
+    @Test
     fun preservesRepeatedRequestHeaders() {
         val request = Hyper4kRequest("GET", "/", "", "X-Test: one\nx-test: two\n", ByteArray(0))
 

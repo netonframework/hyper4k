@@ -10,6 +10,37 @@ import kotlin.test.assertEquals
  */
 class EncodeHeadersTest {
 
+    @Test
+    fun commonContentTypesPreserveExactBytes() {
+        for (type in listOf("text/plain; charset=utf-8", "application/json",
+            "application/json; charset=utf-8", "text/html; charset=utf-8")) {
+            assertEquals("Content-Type: $type", encode(mapOf("Content-Type" to listOf(type))))
+        }
+    }
+
+    @Test
+    fun commonTypeDoesNotHideOtherHeadersOrRepeatedValues() {
+        assertEquals("Content-Type: application/json\nSet-Cookie: a=1\nSet-Cookie: b=2",
+            encode(linkedMapOf("Content-Type" to listOf("application/json"),
+                "Set-Cookie" to listOf("a=1", "b=2"))))
+        assertEquals("Content-Type: application/json\nContent-Type: text/plain",
+            encode(mapOf("Content-Type" to listOf("application/json", "text/plain"))))
+        assertEquals("content-type: application/json",
+            encode(mapOf("content-type" to listOf("application/json"))))
+    }
+
+    @Test
+    fun changesToSourceHeadersDoNotChangePreviouslyEncodedBytes() {
+        val values = mutableListOf("application/json")
+        val headers = mutableMapOf("Content-Type" to values)
+        val first = encodeHeadersForTest(headers)
+        values[0] = "custom/type"
+        assertEquals("Content-Type: application/json", first.decodeToString())
+        assertEquals("Content-Type: custom/type", encode(headers))
+        headers.clear()
+        assertEquals("", encode(headers))
+    }
+
     private fun encode(h: Map<String, List<String>>) =
         encodeHeadersForTest(h).decodeToString()
 
