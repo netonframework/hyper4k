@@ -264,17 +264,20 @@ pub unsafe extern "C" fn hyper4k_client_new(
     // success would defer the error to the first HTTPS request, where it reads
     // as a network problem instead of a configuration one.
     let tls_pool = match super::tls::TlsClientConnector::new(&tls_opts) {
-        Ok(c) => Some(Arc::new(Pool::new(Arc::new(c)))),
+        Ok(c) => Some(Arc::new(Pool::new(Arc::new(c)).with_max_connections_per_key(o.max_conns_per_host))),
         Err(HYPER4K_ERR_TLS_CA) => return HYPER4K_STATUS_INVALID_ARG,
         Err(_) => None, // no platform trust store: plaintext still works
     };
 
     let client = Hyper4kClient {
         runtime: Some(runtime),
-        pool: Arc::new(Pool::new(Arc::new(PlaintextConnector {
-            connect_timeout,
-            proxy: proxy.clone(),
-        }))),
+        pool: Arc::new(
+            Pool::new(Arc::new(PlaintextConnector {
+                connect_timeout,
+                proxy: proxy.clone(),
+            }))
+            .with_max_connections_per_key(o.max_conns_per_host),
+        ),
         tls_pool,
         requests: Arc::new(DashMap::new()),
         next_id: AtomicU64::new(1),

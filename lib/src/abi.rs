@@ -112,7 +112,7 @@ pub struct Hyper4kError {
 // ---------------------------------------------------------------------------
 
 /// `(major << 16) | minor`. A major change means incompatible.
-const ABI_VERSION: u32 = (4 << 16) | 1; // major 4, minor 1: proxy_url in options
+const ABI_VERSION: u32 = (4 << 16) | 2; // major 4, minor 2: max_conns_per_host in options
 
 const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
@@ -168,10 +168,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_four_one() {
+    fn abi_version_is_four_two() {
         // Spelled out rather than reusing ABI_VERSION: this pins the value a
         // Kotlin or C consumer will hold, not our own expression for it.
-        assert_eq!(hyper4k_abi_version(), 0x0004_0001);
+        assert_eq!(hyper4k_abi_version(), 0x0004_0002);
     }
 
     #[test]

@@ -167,6 +167,11 @@ typedef struct {
        and non-HTTP proxies are refused at hyper4k_client_new. */
     const uint8_t *proxy_url;
     size_t         proxy_url_len;
+    /* ABI 4.2. Per-host connection cap for the pool. 0 = built-in default (8).
+       When every connection to a host is busy the pool refuses the dial with a
+       connect error rather than queueing, so a caller fanning out more than this
+       many concurrent requests to one host must raise it. */
+    uint32_t       max_conns_per_host;
 } Hyper4kClientOptions;
 
 /* The Rust side is the source of truth for this layout. Before this assert the
@@ -174,7 +179,7 @@ typedef struct {
    Kotlin caller then wrote custom_ca_pem eight bytes early, so the CA bundle
    silently never applied while the client reported success. */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(Hyper4kClientOptions) == 88, "Hyper4kClientOptions layout must match lib/src/client/mod.rs");
+_Static_assert(sizeof(Hyper4kClientOptions) == 96, "Hyper4kClientOptions layout must match lib/src/client/mod.rs");
 #endif
 
 typedef struct {

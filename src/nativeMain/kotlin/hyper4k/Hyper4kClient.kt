@@ -102,6 +102,7 @@ class Hyper4kClient(options: Hyper4kClientOptions = Hyper4kClientOptions()) {
             options.requestTimeoutMillis?.let { opts.request_timeout_ms = it.toULong() }
             options.readIdleTimeoutMillis?.let { opts.read_idle_timeout_ms = it.toULong() }
             options.maxRetries?.let { opts.max_retries = it.toUInt() }
+            options.maxConnectionsPerHost?.let { opts.max_conns_per_host = it.toUInt() }
 
             val out = alloc<CPointerVar<cnames.structs.Hyper4kClient>>()
             val pem = options.customCaPem ?: ByteArray(0)
@@ -254,6 +255,12 @@ class Hyper4kClientOptions(
     val readIdleTimeoutMillis: Long? = null,
     /** Additional attempts after the first; 0 means try once. */
     val maxRetries: Int? = null,
+    /**
+     * Per-host connection cap (ABI 4.2). Default 8. The pool refuses a dial with a
+     * connect error when the host is at the cap instead of queueing, so a caller
+     * that fans out wider than this to one host must raise it.
+     */
+    val maxConnectionsPerHost: Int? = null,
     /** Fail instead of downgrading when ALPN does not yield h2. */
     val requireHttp2: Boolean = false,
     /** PEM bundle appended to (or, with [replaceSystemCa], replacing) the platform roots. */

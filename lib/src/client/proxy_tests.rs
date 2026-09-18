@@ -131,7 +131,7 @@ fn rt() -> tokio::runtime::Runtime {
 #[test]
 fn capability_bit_is_lit() {
     assert_ne!(hyper4k_client_capabilities() & HYPER4K_CLIENT_CAP_PROXY, 0);
-    assert_eq!(hyper4k_abi_version(), (4 << 16) | 1);
+    assert_eq!(hyper4k_abi_version(), (4 << 16) | 2);
 }
 
 #[test]

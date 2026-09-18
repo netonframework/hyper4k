@@ -210,9 +210,12 @@ impl Pool {
         }
     }
 
-    #[cfg(test)]
+    /// Raise the per-key cap. 0 keeps the default; the pool never queues on a
+    /// full key, so this is the only lever a wide fan-out caller has.
     pub(crate) fn with_max_connections_per_key(mut self, n: u32) -> Self {
-        self.max_conns_per_key = n;
+        if n > 0 {
+            self.max_conns_per_key = n;
+        }
         self
     }
 

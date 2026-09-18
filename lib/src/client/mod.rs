@@ -82,6 +82,10 @@ pub struct Hyper4kClientOptions {
     /// CONNECT tunnel. Credentials and non-HTTP proxies are refused.
     pub proxy_url: *const u8,
     pub proxy_url_len: usize,
+    /// ABI 4.2. Per-host connection cap. 0 uses the built-in default (8).
+    /// A full pool refuses the dial with a connect error instead of queueing,
+    /// so callers that fan out wider than this to one host must raise it.
+    pub max_conns_per_host: u32,
 }
 
 #[repr(C)]
@@ -158,6 +162,7 @@ pub unsafe extern "C" fn hyper4k_client_options_init(
         custom_ca_pem_len: 0,
         proxy_url: std::ptr::null(),
         proxy_url_len: 0,
+        max_conns_per_host: 0,
     };
     init_prefix(opts, struct_size, OPTIONS_MIN_SIZE, defaults)
 }
