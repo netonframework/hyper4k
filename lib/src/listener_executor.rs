@@ -1,28 +1,46 @@
 use std::future::Future;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+const CLOSING: u64 = 1 << 63;
+
+struct State {
+    active: AtomicU64,
+    idle: Notify,
+}
 
 /// Hyper spawns HTTP/2 stream tasks separately from the connection future.
-/// Track them per listener so stopping one server also fences its callbacks.
+/// Track them per listener without a cancellation wrapper around every task.
 #[derive(Clone)]
 pub(crate) struct ListenerExecutor {
-    tasks: TaskTracker,
-    shutdown: CancellationToken,
+    state: Arc<State>,
 }
 
 impl ListenerExecutor {
     pub(crate) fn new() -> Self {
         Self {
-            tasks: TaskTracker::new(),
-            shutdown: CancellationToken::new(),
+            state: Arc::new(State {
+                active: AtomicU64::new(0),
+                idle: Notify::new(),
+            }),
         }
     }
 
     /// Call only after every connection task has joined (no new stream producers).
     pub(crate) async fn stop(&self) {
-        self.shutdown.cancel();
-        self.tasks.close();
-        self.tasks.wait().await;
+        self.close();
+        loop {
+            let notified = self.state.idle.notified();
+            if self.state.active.load(Ordering::Acquire) == CLOSING {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn close(&self) {
+        self.state.active.fetch_or(CLOSING, Ordering::AcqRel);
     }
 }
 
@@ -32,12 +50,27 @@ where
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
-        let shutdown = self.shutdown.clone();
-        self.tasks.spawn(async move {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {},
-                _ = future => {},
+        let state = self.state.clone();
+        let mut current = state.active.load(Ordering::Acquire);
+        loop {
+            if current & CLOSING != 0 {
+                return;
+            }
+            match state.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+        tokio::spawn(async move {
+            future.await;
+            let previous = state.active.fetch_sub(1, Ordering::AcqRel);
+            if previous == 1 || previous == CLOSING + 1 {
+                state.idle.notify_waiters();
             }
         });
     }

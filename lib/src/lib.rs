@@ -31,6 +31,8 @@ use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
+mod listener_executor;
+
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Streaming body channel capacity. Kept small: a bigger buffer only piles bytes
@@ -320,8 +322,6 @@ fn build_response(delivery: Delivery) -> Response<Hyper4kBody> {
         .body(body)
         .unwrap_or_else(|_| error_response(500, b"hyper4k: bad response"))
 }
-
-mod listener_executor;
 
 pub struct Hyper4kServer {
     // Keeps the runtime alive for this listener's lifetime. `Owned` created its
