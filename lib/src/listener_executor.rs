@@ -29,7 +29,7 @@ impl ListenerExecutor {
 
     /// Call only after every connection task has joined (no new stream producers).
     pub(crate) async fn stop(&self) {
-        self.close();
+        self.state.active.fetch_or(CLOSING, Ordering::AcqRel);
         loop {
             let notified = self.state.idle.notified();
             if self.state.active.load(Ordering::Acquire) == CLOSING {
@@ -37,10 +37,6 @@ impl ListenerExecutor {
             }
             notified.await;
         }
-    }
-
-    fn close(&self) {
-        self.state.active.fetch_or(CLOSING, Ordering::AcqRel);
     }
 }
 
