@@ -40,8 +40,8 @@ class AbiWidthTest {
     }
 
     @Test
-    fun abiVersionIsFourOne() {
-        assertEquals((4 shl 16) or 1, hyper4k_abi_version().toInt())
+    fun abiVersionIsFourTwo() {
+        assertEquals((4 shl 16) or 2, hyper4k_abi_version().toInt())
     }
 
     @Test
