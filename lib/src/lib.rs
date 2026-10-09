@@ -5,6 +5,10 @@
 //!
 //! 详细 ABI 契约见 `include/hyper4k.h`。
 
+// Every unsafe operation in an `unsafe fn` is spelled out in its own `unsafe` block (the edition 2024 lint, as an
+// error here): the FFI entry points are where the C side's promises are taken on trust, one by one.
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod abi;
 pub mod client;
 
@@ -13,6 +17,7 @@ use std::convert::Infallible;
 use std::ffi::{c_char, c_void, CStr};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -426,7 +431,7 @@ async fn handle(
 ///
 /// # Safety
 /// `host` 必须是合法的 NUL 结尾 C 字符串；`user_data` 在 server 存活期间必须有效。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_server_start(
     host: *const c_char,
     port: u16,
@@ -436,7 +441,8 @@ pub unsafe extern "C" fn hyper4k_server_start(
     let host = if host.is_null() {
         "0.0.0.0".to_owned()
     } else {
-        CStr::from_ptr(host)
+        // SAFETY: a non-null `host` is a NUL-terminated C string (this function's contract).
+        unsafe { CStr::from_ptr(host) }
             .to_str()
             .unwrap_or("0.0.0.0")
             .to_owned()
@@ -482,7 +488,7 @@ pub unsafe extern "C" fn hyper4k_server_start(
 /// count (deployment/diagnostic override). Returns null if the runtime cannot be
 /// built. The caller owns the handle and must call [`hyper4k_runtime_shutdown`]
 /// after every listener started on it has stopped.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_runtime_new(worker_threads: u32) -> *mut Hyper4kRuntime {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
@@ -501,12 +507,13 @@ pub unsafe extern "C" fn hyper4k_runtime_new(worker_threads: u32) -> *mut Hyper4
 /// listener still holds its Arc just decrements the count — the last holder frees
 /// it — so a mis-ordered shutdown cannot leave a listener running on a freed
 /// runtime, nor abort in-flight work on other listeners.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_runtime_shutdown(handle: *mut Hyper4kRuntime) {
-    if handle.is_null() {
+    let Some(handle) = NonNull::new(handle) else {
         return;
-    }
-    drop(Box::from_raw(handle));
+    };
+    // SAFETY: a non-null `handle` came from `hyper4k_runtime_new` (Box::into_raw) and is released once.
+    drop(unsafe { Box::from_non_null(handle) });
 }
 
 /// Like [`hyper4k_server_start`] but binds the listener on a shared application
@@ -515,7 +522,7 @@ pub unsafe extern "C" fn hyper4k_runtime_shutdown(handle: *mut Hyper4kRuntime) {
 /// tasks; the shared runtime and other listeners are untouched. A bind failure returns null without
 /// affecting the runtime (local recovery). `runtime` must be a live handle from
 /// [`hyper4k_runtime_new`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_server_start_on(
     runtime: *mut Hyper4kRuntime,
     host: *const c_char,
@@ -526,12 +533,14 @@ pub unsafe extern "C" fn hyper4k_server_start_on(
     if runtime.is_null() {
         return std::ptr::null_mut();
     }
-    let shared = (*runtime).rt.clone();
+    // SAFETY: a non-null `runtime` is a live handle from `hyper4k_runtime_new` (this function's contract).
+    let shared = unsafe { &*runtime }.rt.clone();
 
     let host = if host.is_null() {
         "0.0.0.0".to_owned()
     } else {
-        CStr::from_ptr(host).to_str().unwrap_or("0.0.0.0").to_owned()
+        // SAFETY: a non-null `host` is a NUL-terminated C string.
+        unsafe { CStr::from_ptr(host) }.to_str().unwrap_or("0.0.0.0").to_owned()
     };
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
         Ok(a) => a,
@@ -689,7 +698,7 @@ fn build_tls_config(
 ///
 /// # Safety
 /// `host`, `cert_path`, `key_path` and `alpn` must be NUL-terminated or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_server_start_tls(
     host: *const c_char,
     port: u16,
@@ -703,7 +712,8 @@ pub unsafe extern "C" fn hyper4k_server_start_tls(
         if p.is_null() {
             fallback.to_owned()
         } else {
-            CStr::from_ptr(p).to_str().unwrap_or(fallback).to_owned()
+            // SAFETY: every non-null string argument is NUL-terminated (this function's contract).
+            unsafe { CStr::from_ptr(p) }.to_str().unwrap_or(fallback).to_owned()
         }
     };
     let host = as_str(host, "0.0.0.0");
@@ -753,7 +763,7 @@ pub unsafe extern "C" fn hyper4k_server_start_tls(
 ///
 /// # Safety
 /// 响应缓冲必须在本次调用期间保持有效。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_respond(
     responder: u64,
     status: u16,
@@ -766,11 +776,13 @@ pub unsafe extern "C" fn hyper4k_respond(
         return 0;
     }
 
-    let headers = parse_headers(headers_ptr, headers_len);
+    // SAFETY: the header and body buffers are valid for their lengths during this call (this function's contract).
+    let headers = unsafe { parse_headers(headers_ptr, headers_len) };
     let body = if body_ptr.is_null() || body_len == 0 {
         Vec::new()
     } else {
-        std::slice::from_raw_parts(body_ptr, body_len).to_vec()
+        // SAFETY: as above, a non-null `body_ptr` is valid for `body_len` bytes.
+        unsafe { std::slice::from_raw_parts(body_ptr, body_len) }.to_vec()
     };
 
     if active_streams().contains_key(&responder) {
@@ -818,7 +830,7 @@ fn deliver_response(responder: u64, delivery: Delivery) -> i32 {
 /// # Safety
 /// `src_ptr`/`dst_ptr` must be valid for `src_len`/`dst_cap` bytes (or null with
 /// the matching length 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_gzip(
     src_ptr: *const u8,
     src_len: usize,
@@ -829,7 +841,8 @@ pub unsafe extern "C" fn hyper4k_gzip(
     let src = if src_ptr.is_null() || src_len == 0 {
         &[][..]
     } else {
-        std::slice::from_raw_parts(src_ptr, src_len)
+        // SAFETY: a non-null `src_ptr` is valid for `src_len` bytes (this function's contract).
+        unsafe { std::slice::from_raw_parts(src_ptr, src_len) }
     };
     let mut enc = flate2::write::GzEncoder::new(
         Vec::with_capacity(src.len() / 2 + 64),
@@ -846,7 +859,8 @@ pub unsafe extern "C" fn hyper4k_gzip(
         return -(out.len() as i64);
     }
     if !dst_ptr.is_null() && !out.is_empty() {
-        std::ptr::copy_nonoverlapping(out.as_ptr(), dst_ptr, out.len());
+        // SAFETY: `dst_ptr` is valid for `dst_cap >= out.len()` bytes and cannot overlap our own `out`.
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), dst_ptr, out.len()) };
     }
     out.len() as i64
 }
@@ -868,7 +882,7 @@ fn deliver_through_channel(responder: u64, delivery: Delivery) -> i32 {
 ///
 /// # Safety
 /// The header buffer must stay valid for the duration of this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_response_begin(
     responder: u64,
     status: u16,
@@ -879,7 +893,8 @@ pub unsafe extern "C" fn hyper4k_response_begin(
         return HYPER4K_ERR_WRONG_STATE;
     }
 
-    let headers = parse_headers(headers_ptr, headers_len);
+    // SAFETY: the header buffer is valid for `headers_len` bytes during this call (this function's contract).
+    let headers = unsafe { parse_headers(headers_ptr, headers_len) };
     let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_CAPACITY);
 
     // Claim the state before delivering: another thread can call write() before
@@ -921,7 +936,7 @@ pub unsafe extern "C" fn hyper4k_response_begin(
 ///
 /// # Safety
 /// The chunk buffer must stay valid for the duration of this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_response_write(
     responder: u64,
     chunk_ptr: *const u8,
@@ -943,7 +958,8 @@ pub unsafe extern "C" fn hyper4k_response_write(
     if chunk_ptr.is_null() {
         return HYPER4K_ERR_WRONG_STATE;
     }
-    let chunk = Bytes::copy_from_slice(std::slice::from_raw_parts(chunk_ptr, chunk_len));
+    // SAFETY: the chunk is valid for `chunk_len` bytes during this call (this function's contract); it is copied.
+    let chunk = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(chunk_ptr, chunk_len) });
 
     match sender.try_send(chunk) {
         Ok(()) => HYPER4K_OK,
@@ -967,7 +983,7 @@ pub unsafe extern "C" fn hyper4k_response_write(
 /// Ends the streaming response and releases the responder.
 ///
 /// Idempotent: a repeated call returns `HYPER4K_ERR_WRONG_STATE`, not UB.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hyper4k_response_finish(responder: u64) -> i32 {
     if responder == 0 {
         return HYPER4K_ERR_WRONG_STATE;
@@ -986,12 +1002,13 @@ pub extern "C" fn hyper4k_response_finish(responder: u64) -> i32 {
 /// Call from outside a Tokio runtime and never from a request callback. This
 /// blocks until this listener's connections finish cancellation, so user_data
 /// can be released after it returns. Application handlers should drain first.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_server_stop(server: *mut Hyper4kServer) {
-    if server.is_null() {
+    let Some(server) = NonNull::new(server) else {
         return;
-    }
-    let mut s = Box::from_raw(server);
+    };
+    // SAFETY: a non-null `server` came from a `hyper4k_server_start*` (Box::into_raw) and is stopped once.
+    let mut s = unsafe { Box::from_non_null(server) };
     if let Some(tx) = s.shutdown_tx.take() {
         let _ = tx.send(());
     }
@@ -1017,7 +1034,8 @@ unsafe fn parse_headers(ptr: *const u8, len: usize) -> HeaderMap {
     if ptr.is_null() || len == 0 {
         return map;
     }
-    let raw = std::slice::from_raw_parts(ptr, len);
+    // SAFETY: the caller passes a buffer valid for `len` bytes (see the call sites).
+    let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
     for line in raw.split(|b| *b == b'\n') {
         let line = match line.strip_suffix(b"\r") {
             Some(l) => l,

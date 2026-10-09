@@ -65,7 +65,9 @@ than not claiming it.
 
 ## Building the Rust crate
 
-Needs a local Rust toolchain. Produce `libhyper4k.a` per target from `lib/`:
+Needs rustup. `lib/rust-toolchain.toml` pins Rust 1.99.0 and its five targets, which rustup installs on the first
+`cargo` call there; the crate is edition 2024 with `rust-version = "1.99"`, and every unsafe operation inside an FFI entry
+point sits in its own `unsafe` block (`#![deny(unsafe_op_in_unsafe_fn)]`). Produce `libhyper4k.a` per target from `lib/`:
 
 ```bash
 cd lib

@@ -116,13 +116,13 @@ const ABI_VERSION: u32 = (4 << 16) | 2; // major 4, minor 2: max_conns_per_host 
 
 const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hyper4k_abi_version() -> u32 {
     ABI_VERSION
 }
 
 /// NUL-terminated crate version. Static storage; the caller must not free it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hyper4k_version() -> *const c_char {
     VERSION_CSTR.as_ptr() as *const c_char
 }
@@ -132,7 +132,7 @@ pub const HYPER4K_SERVER_CAP_H2C: u64 = 1 << 1;
 pub const HYPER4K_SERVER_CAP_STREAMING: u64 = 1 << 2;
 
 /// Server capabilities. These three shipped in ABI v3 with tests behind them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hyper4k_server_capabilities() -> u64 {
     HYPER4K_SERVER_CAP_HTTP1 | HYPER4K_SERVER_CAP_H2C | HYPER4K_SERVER_CAP_STREAMING
 }
@@ -152,7 +152,7 @@ pub const HYPER4K_CLIENT_CAP_PROXY: u64 = 1 << 6;
 /// A bit appears here only once its feature is implemented **and tested** — not
 /// when it partially works. Each task in the implementation plan lights its own
 /// bits in its own commit.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hyper4k_client_capabilities() -> u64 {
     HYPER4K_CLIENT_CAP_HTTP1
         | HYPER4K_CLIENT_CAP_HTTP2

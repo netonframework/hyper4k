@@ -118,6 +118,9 @@ pub const REQUEST_MIN_SIZE: u32 = 8 + 2 * size_of::<Hyper4kSlice>() as u32;
 /// Taking the caller's allocation size is not optional: a caller built against
 /// a smaller v4.0 struct that loads a v4.1 library would otherwise be written
 /// past the end of its own allocation.
+///
+/// # Safety
+/// A non-null `ptr` must point to at least `struct_size` writable bytes.
 unsafe fn init_prefix<T>(
     ptr: *mut T,
     struct_size: u32,
@@ -132,7 +135,9 @@ unsafe fn init_prefix<T>(
     }
     let writable = (struct_size as usize).min(size_of::<T>());
     let src = &defaults as *const T as *const u8;
-    std::ptr::copy_nonoverlapping(src, ptr as *mut u8, writable);
+    // SAFETY: `ptr` has `struct_size >= writable` writable bytes (contract above); `defaults` is our own local,
+    // `writable <= size_of::<T>()`, and the two cannot overlap.
+    unsafe { std::ptr::copy_nonoverlapping(src, ptr as *mut u8, writable) };
     // `defaults` was moved bytewise; running its destructor would be a
     // double-free if T ever gains one.
     std::mem::forget(defaults);
@@ -143,7 +148,7 @@ unsafe fn init_prefix<T>(
 ///
 /// # Safety
 /// `opts` must point to at least `struct_size` writable, correctly aligned bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_options_init(
     opts: *mut Hyper4kClientOptions,
     struct_size: u32,
@@ -164,14 +169,15 @@ pub unsafe extern "C" fn hyper4k_client_options_init(
         proxy_url_len: 0,
         max_conns_per_host: 0,
     };
-    init_prefix(opts, struct_size, OPTIONS_MIN_SIZE, defaults)
+    // SAFETY: `opts` points to `struct_size` writable bytes (this function's contract).
+    unsafe { init_prefix(opts, struct_size, OPTIONS_MIN_SIZE, defaults) }
 }
 
 /// Fill `request` with this build's defaults.
 ///
 /// # Safety
 /// `request` must point to at least `struct_size` writable, correctly aligned bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_request_init(
     request: *mut Hyper4kClientRequest,
     struct_size: u32,
@@ -193,7 +199,8 @@ pub unsafe extern "C" fn hyper4k_client_request_init(
         body_len: 0,
         read_idle_timeout_ms: u64::MAX,
     };
-    init_prefix(request, struct_size, REQUEST_MIN_SIZE, defaults)
+    // SAFETY: `request` points to `struct_size` writable bytes (this function's contract).
+    unsafe { init_prefix(request, struct_size, REQUEST_MIN_SIZE, defaults) }
 }
 
 /// Build a full local struct from a caller's (possibly shorter) buffer.
@@ -207,7 +214,8 @@ pub unsafe extern "C" fn hyper4k_client_request_init(
 /// `src` must point to at least `caller_size` readable bytes.
 pub(crate) unsafe fn copy_prefix<T>(src: *const u8, caller_size: u32, mut defaults: T) -> T {
     let n = (caller_size as usize).min(size_of::<T>());
-    std::ptr::copy_nonoverlapping(src, &mut defaults as *mut T as *mut u8, n);
+    // SAFETY: `src` has `caller_size >= n` readable bytes (contract above); `n <= size_of::<T>()` fits our local.
+    unsafe { std::ptr::copy_nonoverlapping(src, &mut defaults as *mut T as *mut u8, n) };
     defaults
 }
 

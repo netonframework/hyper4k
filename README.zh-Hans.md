@@ -59,7 +59,9 @@ int32_t        hyper4k_response_finish(responder);
 
 ## 构建 Rust crate
 
-需要本机 Rust 工具链。在 `lib/` 目录下逐 target 产出 `libhyper4k.a`：
+需要 rustup。`lib/rust-toolchain.toml` 固定 Rust 1.99.0 及五个 target，首次在该目录运行 `cargo` 时由 rustup 自动安装；
+crate 使用 edition 2024、`rust-version = "1.99"`，FFI 入口函数里的每个 unsafe 操作都写在各自的 `unsafe` 块中
+（`#![deny(unsafe_op_in_unsafe_fn)]`）。在 `lib/` 目录下逐 target 产出 `libhyper4k.a`：
 
 ```bash
 cd lib

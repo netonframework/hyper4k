@@ -15,6 +15,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,6 +180,8 @@ fn to_origin_form(mut req: hyper::Request<Full<Bytes>>) -> hyper::Request<Full<B
     req
 }
 
+/// # Safety
+/// A non-null `s.ptr` must be valid for `s.len` bytes.
 unsafe fn slice_bytes(s: &crate::Hyper4kSlice) -> Option<Bytes> {
     if s.len == 0 {
         return Some(Bytes::new());
@@ -186,16 +189,15 @@ unsafe fn slice_bytes(s: &crate::Hyper4kSlice) -> Option<Bytes> {
     if s.ptr.is_null() {
         return None;
     }
-    Some(Bytes::copy_from_slice(std::slice::from_raw_parts(
-        s.ptr, s.len,
-    )))
+    // SAFETY: non-null and valid for `s.len` bytes (contract above); copied before returning.
+    Some(Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(s.ptr, s.len) }))
 }
 
 /// Create a client.
 ///
 /// # Safety
 /// `opts` and `out_client` must be valid pointers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_new(
     opts: *const Hyper4kClientOptions,
     out_client: *mut *mut Hyper4kClient,
@@ -206,14 +208,20 @@ pub unsafe extern "C" fn hyper4k_client_new(
     // Read only the prefix the caller allocated. Dereferencing their shorter
     // buffer as a full struct would read past the end of their allocation —
     // exactly the bug the init functions are careful to avoid on the write side.
-    let raw_size =
-        std::ptr::read_unaligned((opts as *const u8).add(std::mem::size_of::<u32>()) as *const u32);
-    let raw_abi = std::ptr::read_unaligned(opts as *const u32);
+    // SAFETY: `opts` points to at least the two leading u32 fields (abi_version, struct_size) of the options
+    // (this function's contract); they are read unaligned and the rest only after the size is checked.
+    let (raw_abi, raw_size) = unsafe {
+        (
+            std::ptr::read_unaligned(opts as *const u32),
+            std::ptr::read_unaligned((opts as *const u8).add(std::mem::size_of::<u32>()) as *const u32),
+        )
+    };
     let st = validate_header(raw_abi, raw_size, OPTIONS_MIN_SIZE);
     if st != HYPER4K_STATUS_OK {
         return st;
     }
-    let o = &copy_prefix::<Hyper4kClientOptions>(opts as *const u8, raw_size, defaults_options());
+    // SAFETY: the caller's struct is `raw_size` bytes long, as it says in its own header.
+    let o = &unsafe { copy_prefix::<Hyper4kClientOptions>(opts as *const u8, raw_size, defaults_options()) };
     // An unknown flag is refused, never ignored: the bit we drop could be the
     // one carrying a security decision.
     if o.flags & !KNOWN_CLIENT_FLAGS != 0 {
@@ -234,7 +242,8 @@ pub unsafe extern "C" fn hyper4k_client_new(
     let custom_ca = if o.custom_ca_pem.is_null() || o.custom_ca_pem_len == 0 {
         None
     } else {
-        Some(std::slice::from_raw_parts(o.custom_ca_pem, o.custom_ca_pem_len).to_vec())
+        // SAFETY: a non-null CA pointer is valid for its length during this call (options contract); copied.
+        Some(unsafe { std::slice::from_raw_parts(o.custom_ca_pem, o.custom_ca_pem_len) }.to_vec())
     };
     // A proxy that cannot be honoured is refused here, not on the first
     // request: a client that silently connects directly when it was told to
@@ -242,7 +251,8 @@ pub unsafe extern "C" fn hyper4k_client_new(
     let proxy = if o.proxy_url.is_null() || o.proxy_url_len == 0 {
         None
     } else {
-        let raw = std::slice::from_raw_parts(o.proxy_url, o.proxy_url_len);
+        // SAFETY: a non-null proxy URL is valid for its length during this call (options contract).
+        let raw = unsafe { std::slice::from_raw_parts(o.proxy_url, o.proxy_url_len) };
         let Ok(text) = std::str::from_utf8(raw) else {
             return HYPER4K_STATUS_INVALID_ARG;
         };
@@ -299,7 +309,8 @@ pub unsafe extern "C" fn hyper4k_client_new(
         read_idle_timeout: (o.read_idle_timeout_ms != 0)
             .then(|| Duration::from_millis(o.read_idle_timeout_ms)),
     };
-    *out_client = Box::into_raw(Box::new(client));
+    // SAFETY: `out_client` is a valid, non-null pointer (checked above; this function's contract).
+    unsafe { *out_client = Box::into_raw(Box::new(client)) };
     HYPER4K_STATUS_OK
 }
 
@@ -307,12 +318,13 @@ pub unsafe extern "C" fn hyper4k_client_new(
 ///
 /// # Safety
 /// `client` must come from `hyper4k_client_new` and not yet be freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_close(client: *mut Hyper4kClient) {
     if client.is_null() {
         return;
     }
-    let c = &*client;
+    // SAFETY: a non-null `client` is live (this function's contract).
+    let c = unsafe { &*client };
     c.closed.store(true, Ordering::SeqCst);
     // Every accepted request still gets exactly one OnDone.
     let ids: Vec<u64> = c.requests.iter().map(|e| *e.key()).collect();
@@ -345,13 +357,15 @@ pub unsafe extern "C" fn hyper4k_client_close(client: *mut Hyper4kClient) {
 /// # Safety
 /// Requires exclusive ownership. MUST NOT be called from a callback thread —
 /// it would wait on the very bridge that is running the callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_free(client: *mut Hyper4kClient) {
-    if client.is_null() {
+    let Some(client) = NonNull::new(client) else {
         return;
-    }
-    hyper4k_client_close(client);
-    let mut boxed = Box::from_raw(client);
+    };
+    // SAFETY: the caller owns the live client exclusively (this function's contract): closing it, then taking
+    // back the Box that `hyper4k_client_new` leaked, happens once.
+    unsafe { hyper4k_client_close(client.as_ptr()) };
+    let mut boxed = unsafe { Box::from_non_null(client) };
 
     // Wait for every bridge to finish its OnDone. No timeout: freeing while a
     // callback is still running would hand the caller a dangling user_data,
@@ -382,7 +396,7 @@ pub unsafe extern "C" fn hyper4k_client_free(client: *mut Hyper4kClient) {
 ///
 /// # Safety
 /// All pointers must be valid; slices are copied before returning.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_send(
     client: *mut Hyper4kClient,
     request: *const Hyper4kClientRequest,
@@ -401,22 +415,27 @@ pub unsafe extern "C" fn hyper4k_client_send(
     let (Some(on_headers), Some(on_done)) = (on_headers, on_done) else {
         return HYPER4K_STATUS_INVALID_ARG;
     };
-    let c = &*client;
-    let raw_size = std::ptr::read_unaligned(
-        (request as *const u8).add(std::mem::size_of::<u32>()) as *const u32
-    );
-    let raw_abi = std::ptr::read_unaligned(request as *const u32);
+    // SAFETY: `client` is live and `request` points to at least its two leading u32 fields (this function's
+    // contract); the rest of the request is read only after its declared size is checked.
+    let c = unsafe { &*client };
+    let (raw_abi, raw_size) = unsafe {
+        (
+            std::ptr::read_unaligned(request as *const u32),
+            std::ptr::read_unaligned((request as *const u8).add(std::mem::size_of::<u32>()) as *const u32),
+        )
+    };
     let st = validate_header(raw_abi, raw_size, REQUEST_MIN_SIZE);
     if st != HYPER4K_STATUS_OK {
         return st;
     }
-    let r =
-        &copy_prefix::<Hyper4kClientRequest>(request as *const u8, raw_size, defaults_request());
+    // SAFETY: the caller's request is `raw_size` bytes long, as its own header says.
+    let r = &unsafe { copy_prefix::<Hyper4kClientRequest>(request as *const u8, raw_size, defaults_request()) };
     if c.closed.load(Ordering::SeqCst) {
         return HYPER4K_STATUS_CLIENT_CLOSED;
     }
 
-    let (Some(method_b), Some(url_b)) = (slice_bytes(&r.method), slice_bytes(&r.url)) else {
+    // SAFETY: the request's slices are valid for their lengths during this call (this function's contract).
+    let (Some(method_b), Some(url_b)) = (unsafe { slice_bytes(&r.method) }, unsafe { slice_bytes(&r.url) }) else {
         return HYPER4K_STATUS_INVALID_ARG;
     };
     let Ok(method) = hyper::Method::from_bytes(&method_b) else {
@@ -451,8 +470,9 @@ pub unsafe extern "C" fn hyper4k_client_send(
             return HYPER4K_STATUS_INVALID_ARG;
         }
         for i in 0..r.header_count {
-            let h = &*r.headers.add(i);
-            let (Some(n), Some(v)) = (slice_bytes(&h.name), slice_bytes(&h.value)) else {
+            // SAFETY: `headers` holds `header_count` entries whose slices are valid during this call.
+            let h = unsafe { &*r.headers.add(i) };
+            let (Some(n), Some(v)) = (unsafe { slice_bytes(&h.name) }, unsafe { slice_bytes(&h.value) }) else {
                 return HYPER4K_STATUS_INVALID_ARG;
             };
             headers.push((n, v));
@@ -463,7 +483,8 @@ pub unsafe extern "C" fn hyper4k_client_send(
     } else if r.body_ptr.is_null() {
         return HYPER4K_STATUS_INVALID_ARG;
     } else {
-        Bytes::copy_from_slice(std::slice::from_raw_parts(r.body_ptr, r.body_len))
+        // SAFETY: a non-null body is valid for `body_len` bytes during this call; copied.
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(r.body_ptr, r.body_len) })
     };
 
     // Decide the transport BEFORE anything is registered. Creating the bridge
@@ -530,7 +551,8 @@ pub unsafe extern "C" fn hyper4k_client_send(
     c.requests.insert(id, handle.clone());
 
     // Written before anything can fire, per contract point 1.
-    *out_request_id = id;
+    // SAFETY: `out_request_id` is valid and non-null (checked on entry; this function's contract).
+    unsafe { *out_request_id = id };
 
     let h = handle.clone();
     // UINT64_MAX inherits, 0 disables, anything else overrides.
@@ -555,7 +577,7 @@ pub unsafe extern "C" fn hyper4k_client_send(
 ///
 /// # Safety
 /// `client` must be a live client.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_resume(
     client: *mut Hyper4kClient,
     request_id: u64,
@@ -563,7 +585,8 @@ pub unsafe extern "C" fn hyper4k_client_resume(
     if client.is_null() {
         return HYPER4K_STATUS_INVALID_ARG;
     }
-    let c = &*client;
+    // SAFETY: a non-null `client` is live (this function's contract).
+    let c = unsafe { &*client };
     let Some(h) = c.requests.get(&request_id) else {
         return HYPER4K_STATUS_NOT_FOUND;
     };
@@ -574,12 +597,13 @@ pub unsafe extern "C" fn hyper4k_client_resume(
 ///
 /// # Safety
 /// `client` must be a live client.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_inflight_count(client: *mut Hyper4kClient) -> u32 {
     if client.is_null() {
         return 0;
     }
-    (*client).limits.inflight()
+    // SAFETY: a non-null `client` is live (this function's contract).
+    unsafe { &*client }.limits.inflight()
 }
 
 /// Total parked streams across every pooled connection.
@@ -589,12 +613,13 @@ pub unsafe extern "C" fn hyper4k_client_inflight_count(client: *mut Hyper4kClien
 ///
 /// # Safety
 /// `client` must be a live client.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_paused_stream_count(client: *mut Hyper4kClient) -> u32 {
     if client.is_null() {
         return 0;
     }
-    let c = &*client;
+    // SAFETY: a non-null `client` is live (this function's contract).
+    let c = unsafe { &*client };
     let mut n = c.pool.total_paused();
     if let Some(p) = c.tls_pool.as_ref() {
         n += p.total_paused();
@@ -606,7 +631,7 @@ pub unsafe extern "C" fn hyper4k_client_paused_stream_count(client: *mut Hyper4k
 ///
 /// # Safety
 /// `client` must be a live client.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hyper4k_client_cancel(
     client: *mut Hyper4kClient,
     request_id: u64,
@@ -614,7 +639,8 @@ pub unsafe extern "C" fn hyper4k_client_cancel(
     if client.is_null() {
         return HYPER4K_STATUS_INVALID_ARG;
     }
-    let c = &*client;
+    // SAFETY: a non-null `client` is live (this function's contract).
+    let c = unsafe { &*client };
     let Some(h) = c.requests.get(&request_id) else {
         return HYPER4K_STATUS_NOT_FOUND;
     };

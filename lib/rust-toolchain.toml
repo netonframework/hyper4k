@@ -1,0 +1,13 @@
+# The Rust the C ABI is built with: 1.99.0 (C-variadic definitions, Box::{into,from}_non_null, Vec::{into,from}_parts,
+# raw-pointer layout queries; LLVM 23). Cargo is run from this directory by the Gradle build, one staticlib per
+# Kotlin/Native target, so the targets below are installed with the toolchain.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-gnu",
+]
